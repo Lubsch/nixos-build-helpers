@@ -26,5 +26,11 @@
       }
     );
 
-    };
+    checks = mapSystems (
+      _: pkgs: {
+        default = pkgs.callPackage ./tests.nix { inherit nixpkgs; };
+      }
+    );
+
+  };
 }
