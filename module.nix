@@ -6,16 +6,23 @@
   ...
 }:
 let
+  cfg = config.systemdBuildHelper;
   nixos-build-helpers = pkgs.callPackage ./package.nix {};
 in
 {
+  options.systemdBuildHelper = {
+    etc = lib.mkEnableOption "NixOS build helper for etc overlayfs";
+    etcOverlay = lib.mkEnableOption "NixOS build helper for etc";
+    systemdUnits = lib.mkEnableOption "NixOS build helper for systemd units";
+  };
+
   system.build =
     let
       etc' = lib.filter (f: f.enable) (lib.attrValues config.environment.etc);
       etc-json = pkgs.writeText "etc-json" (builtins.toJSON etc');
     in
     {
-      etcMetadataImage = lib.mkForce (
+      etcMetadataImage = lib.mkIf cfg.etcOverlay (lib.mkForce (
         pkgs.runCommandLocal "etc-metadata.erofs"
           {
             nativeBuildInputs = with pkgs.buildPackages; [
@@ -28,20 +35,20 @@ in
             mkcomposefs --from-file ./etc-dump $out
             fsck.erofs $out
           ''
-      );
-      etc = lib.mkForce (
+      ));
+      etc = lib.mkIf cfg.etc (lib.mkForce (
         pkgs.runCommandLocal "etc" {
           # This is needed for the systemd module
           passthru.targets = map (x: x.target) etc';
         } "${lib.getExe nixos-build-helpers} build-etc ${etc-json}"
-      );
+      ));
     };
 
   _module.args.utils =
     let
       utilsBase = import "${modulesPath}/../lib/utils.nix" { inherit lib config pkgs; };
     in
-    lib.mkForce (
+    lib.mkIf cfg.systemdUnits (lib.mkForce (
       lib.recursiveUpdate utilsBase {
         systemdUtils.lib.generateUnits =
           let
@@ -80,5 +87,5 @@ in
             allowSubstitutes = false;
           } "${lib.getExe nixos-build-helpers} generate-units ${args-json}";
       }
-    );
+    ));
 }
