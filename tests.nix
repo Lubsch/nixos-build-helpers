@@ -17,7 +17,7 @@ let
   test-etc-units = nixpkgs.lib.nixosSystem {
     inherit (stdenv.hostPlatform) system;
     modules = [
-      (import ./module.nix)
+      ./module.nix
       {
         nixosBuildHelpers.etc = true;
         nixosBuildHelpers.systemdUnits = true;
@@ -39,7 +39,7 @@ let
   test-overlay = nixpkgs.lib.nixosSystem {
     inherit (stdenv.hostPlatform) system;
     modules = [
-      (./module.nix)
+      ./module.nix
       {
         system.stateVersion = "26.05";
         system.etc.overlay.enable = true;
@@ -51,6 +51,9 @@ in
 runCommand "smoke-tests"
   {
     nativeBuildInputs = [ diffutils ];
+    passthru = {
+      inherit reference test-etc-units reference-overlay test-overlay;
+    };
   }
   ''
     touch $out # otherwise build always fails
