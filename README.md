@@ -1,4 +1,15 @@
-# Installation
+# nixos-build-helpers
+
+This replaces the nixos builders for
+- `{system,user,initrd,nspawn}-units` (bash)
+- `etc` at `config.system.build.etc` (bash)
+- `config.system.build.etcMetadataImage` (python)
+
+## "Benchmarks"
+
+TODO
+
+## Installation
 
 Add the flake as an input:
 ```nix
