@@ -17,7 +17,7 @@ Add and enable the module:
 {
   imports = [ inputs.nixos-build-helpers.nixosModules.default ];
 
-  systemBuildHelper = {
+  nixosBuildHelpers = {
     etc = true;
     etcOverlay = true;
     systemdUnits = true;

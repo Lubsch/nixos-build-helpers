@@ -6,11 +6,11 @@
   ...
 }:
 let
-  cfg = config.systemBuildHelper;
+  cfg = config.nixosBuildHelpers;
   nixos-build-helpers = pkgs.callPackage ./package.nix { };
 in
 {
-  options.systemBuildHelper = {
+  options.nixosBuildHelpers = {
     etc = lib.mkEnableOption "NixOS build helper for etc overlayfs";
     etcOverlay = lib.mkEnableOption "NixOS build helper for etc";
     systemdUnits = lib.mkEnableOption "NixOS build helper for systemd units";

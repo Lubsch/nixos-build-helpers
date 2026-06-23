@@ -19,8 +19,8 @@ let
     modules = [
       (import ./module.nix)
       {
-        systemBuildHelper.etc = true;
-        systemBuildHelper.systemdUnits = true;
+        nixosBuildHelpers.etc = true;
+        nixosBuildHelpers.systemdUnits = true;
         system.stateVersion = "26.05";
       }
     ];
@@ -43,7 +43,7 @@ let
       {
         system.stateVersion = "26.05";
         system.etc.overlay.enable = true;
-        systemBuildHelper.etcOverlay = true;
+        nixosBuildHelpers.etcOverlay = true;
       }
     ];
   };
