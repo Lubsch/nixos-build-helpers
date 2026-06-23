@@ -5,6 +5,7 @@
       mapSystems = f: builtins.mapAttrs f nixpkgs.legacyPackages;
     in
     {
+      nixosModules.default = import ./module.nix;
 
       devShells = mapSystems (
         _: pkgs: {
@@ -18,5 +19,12 @@
           };
         }
       );
+
+    packages = mapSystems (
+      _: pkgs: {
+        default = pkgs.callPackage ./package.nix {};
+      }
+    );
+
     };
 }
