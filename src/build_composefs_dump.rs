@@ -12,6 +12,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use serde_json::Value;
 
 #[derive(serde::Deserialize)]
 struct Attrs {
@@ -158,13 +159,13 @@ fn add_leading_directories(
     }
 }
 
-pub fn run(mut args: Args) -> anyhow::Result<()> {
-    let config_path = args.next()
-        .context("No config file supplied as argument")?;
+pub fn run(mut _args: Args) -> anyhow::Result<()> {
+    let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
     let config_bytes =
         fs::read(config_path).context("Config isn't accessible")?;
-    let mut config: Vec<Attrs> =
+    let mut config: BTreeMap<String, Value> =
         serde_json::from_slice(&config_bytes).context("Config is invalid")?;
+    let mut config: Vec<Attrs> = serde_json::from_value(config.remove("etc'").unwrap()).unwrap();
 
     eprintln!("Building composefs dump...");
 

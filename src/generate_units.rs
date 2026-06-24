@@ -84,12 +84,11 @@ fn lndir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn run(mut args: std::env::Args) -> anyhow::Result<()> {
-    let args: Args = {
-        let args_path = args.next().context("Missing argument")?;
-        let args_bytes = std::fs::read(args_path)?;
-        serde_json::from_slice(&args_bytes)?
-    };
+pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
+    let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
+    let config_bytes = fs::read(config_path).context("Config isn't accessible")?;
+    let mut config: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&config_bytes).context("Config is invalid")?;
+    let args: Args = serde_json::from_value(config.remove("generate-units-args").unwrap()).unwrap();
 
     let type_dir = match args.units_type.as_str() {
         "system" => Path::new("system"),

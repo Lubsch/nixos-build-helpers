@@ -1,4 +1,5 @@
 use std::{env::{self, Args}, fs::{create_dir_all, read, read_link, write}, os::unix::fs::symlink, path::{Path, PathBuf}};
+use std::collections::BTreeMap;
 use glob::glob;
 use anyhow::Context;
 
@@ -46,9 +47,12 @@ fn make_etc_entry(entry: Entry, etc: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run(mut args: Args) -> anyhow::Result<()> {
-    let etc_json = &read(args.next().context("Pass json file as arg!")?)?;
-    let entries: Vec<Entry> = serde_json::from_slice(etc_json)?;
+pub fn run(mut _args: Args) -> anyhow::Result<()> {
+    let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
+    let config_bytes =
+        read(config_path).context("Config isn't accessible")?;
+    let mut config: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&config_bytes).context("Config is invalid")?;
+    let entries: Vec<Entry> = serde_json::from_value(config.remove("etc'").unwrap()).unwrap();
 
     let etc = PathBuf::from(env::var("out")?).join("etc");
     create_dir_all(&etc)?;
