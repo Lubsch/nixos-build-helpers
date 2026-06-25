@@ -2,8 +2,8 @@
 rustPlatform.buildRustPackage {
   pname = "nixos-build-helpers";
   version = "0.1";
-  cargoLock.lockFile = ./Cargo.lock;
-  src = lib.cleanSource ./.;
+  cargoLock.lockFile = ./src/Cargo.lock;
+  src = lib.cleanSource ./src;
 
   # preCheck = ''
   #   cargo clippy -- -Dwarnings
