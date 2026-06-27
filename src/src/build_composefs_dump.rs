@@ -5,14 +5,16 @@
 use std::collections::BTreeMap;
 use std::env::Args;
 use std::fs;
+use std::os::linux::fs::MetadataExt as _;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path;
 use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
 use serde_json::Value;
+
+const INLINE_CONTENT_MAX: u64 = 4096;
 
 #[derive(serde::Deserialize)]
 struct Attrs {
@@ -67,6 +69,7 @@ impl ComposefsPath {
         mode: &str,
         payload: &str,
         path: Option<PathBuf>,
+        content: Option<String>
     ) -> Self {
         assert!(
             matches!(mode.len(), 3 | 4) && u32::from_str_radix(mode, 8).is_ok(),
@@ -85,7 +88,7 @@ impl ComposefsPath {
             rdev: String::from("0"),
             nlink: 1,
             mtime: String::from("1.0"),
-            content: String::from("-"),
+            content: content.unwrap_or("-".to_string()),
             digest: String::from("-"),
         }
     }
@@ -105,6 +108,37 @@ impl ComposefsPath {
         ]
             .join(" ")
     }
+}
+
+fn dump_short_escapes(b: u8) -> Option<&'static str> {
+    match b {
+        b'\\' => Some("\\\\"),
+        b'\n' => Some("\\n"),
+        b'\r' => Some("\\r"),
+        b'\t' => Some("\\t"),
+        _ => None
+    }
+}
+
+fn escape_dump_field(data: &[u8]) -> String {
+    if data.is_empty() {
+        panic!("cannot escape empty content; emit '-' instead");
+    }
+    if data == b"-" {
+        return String::from("\u{2d}");
+    }
+    let mut out = String::new();
+    for b in data {
+        if let Some(bs) = dump_short_escapes(*b) {
+            out.push_str(bs);
+        } else if *b == b' ' || *b == b'=' || !(0x20 <= *b && *b <= 0x7E) {
+            out.push_str(&format!("\\x{b:02x}"));
+        } else {
+            out.push(char::from(*b));
+        }
+    }
+
+    out
 }
 
 fn normalize_path(path: &Path) -> std::io::Result<PathBuf> {
@@ -154,6 +188,7 @@ fn add_leading_directories(
             "0755",
             "-",
             Some(component.clone()),
+            None
         );
         paths.insert(component, composefs_path);
     }
@@ -192,24 +227,47 @@ pub fn run(mut _args: Args) -> anyhow::Result<()> {
                     "0777",
                     glob_source.to_str().unwrap(),
                     Some(glob_target.clone()),
+                    None
                 );
                 paths.insert(glob_target.clone(), composefs_path);
                 add_leading_directories(&glob_target, attrs, &mut paths);
             }
         } else {
             let composefs_path = if matches!(mode.as_str(), "symlink" | "direct-symlink") {
-                ComposefsPath::new(attrs, 100, FileType::Symlink, "0777", source, None)
+                ComposefsPath::new(attrs, 100, FileType::Symlink, "0777", source, None, None)
             } else if Path::new(source).is_dir() {
-                ComposefsPath::new(attrs, 4096, FileType::Directory, mode, source, None)
+                ComposefsPath::new(attrs, 4096, FileType::Directory, mode, source, None, None)
             } else {
-                ComposefsPath::new(
-                    attrs,
-                    fs::metadata(Path::new(source))?.size(),
-                    FileType::File,
-                    mode,
-                    target.to_str().unwrap().strip_prefix("/").unwrap(),
-                    None,
-                )
+                let mut size = Path::new(source).metadata().unwrap().st_size();
+                if size <= INLINE_CONTENT_MAX {
+                    let content = if size > 0 {
+                        let raw = fs::read(Path::new(source)).unwrap();
+                        size = raw.len() as u64;
+                        escape_dump_field(&raw)
+                    } else {
+                        String::from("-")
+                    };
+                    ComposefsPath::new(
+                        attrs,
+                        size,
+                        FileType::File,
+                        mode,
+                        "-",
+                        None,
+                        Some(content),
+                    )
+                } else {
+                    ComposefsPath::new(
+                        attrs,
+                        size,
+                        FileType::File,
+                        mode,
+                        // payload needs to be relative path in this case
+                        target.to_str().unwrap().strip_prefix("/").unwrap(),
+                        None,
+                        None
+                    )
+                }
             };
 
             paths.insert(target.clone(), composefs_path);
