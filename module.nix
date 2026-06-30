@@ -14,9 +14,39 @@ in
     etc = lib.mkEnableOption "NixOS build helper for etc overlayfs";
     etcOverlay = lib.mkEnableOption "NixOS build helper for etc";
     systemdUnits = lib.mkEnableOption "NixOS build helper for systemd units";
+    buildEnv = lib.mkEnableOption "Nixos build helper to build system path quicker";
   };
 
   config = {
+
+    system.path = lib.mkIf cfg.buildEnv (
+      lib.mkForce (
+        (pkgs.buildEnv {
+          name = "system-path";
+          paths = config.environment.systemPackages;
+          inherit (config.environment) pathsToLink extraOutputsToInstall;
+          ignoreCollisions = true;
+          # !!! Hacky, should modularise.
+          # outputs TODO: note that the tools will often not be linked by default
+          postBuild = ''
+            # Remove wrapped binaries, they shouldn't be accessible via PATH.
+            find $out/bin -maxdepth 1 -name ".*-wrapped" -type l -delete
+            find $out/bin -maxdepth 1 -name ".*-wrapped_*" -type l -delete
+            if [ -x $out/bin/glib-compile-schemas -a -w $out/share/glib-2.0/schemas ]; then
+                $out/bin/glib-compile-schemas $out/share/glib-2.0/schemas
+            fi
+
+            ${config.environment.extraSetup}
+          '';
+        }).overrideDerivation (_: {
+          buildCommand = ''
+            ${lib.getExe nixos-build-helpers} build-env
+            eval "$postBuild"
+          '';
+        })
+      )
+    );
+
     system.build =
       let
         etc' = lib.filter (f: f.enable) (lib.attrValues config.environment.etc);

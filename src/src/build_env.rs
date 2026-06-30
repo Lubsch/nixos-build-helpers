@@ -320,8 +320,9 @@ fn discover_root(
     Ok(())
 }
 
-pub fn run(mut args_iter: std::env::Args) -> anyhow::Result<()> {
-    let config_path = args_iter.next().context("supply JSON config as arg")?;
+pub fn run(mut _args_iter: std::env::Args) -> anyhow::Result<()> {
+    let config_path = std::env::var("NIX_ATTRS_JSON_FILE").unwrap();
+    // let config_path = args_iter.next().context("supply JSON config as arg")?;
     let config_bytes = fs::read(config_path).context("cannot open structured attrs JSON file")?;
     let args: Args = serde_json::from_slice(&config_bytes).context("config is invalid")?;
 
