@@ -2,3 +2,5 @@
 target/
 *json
 result*
+profile.json*
+out

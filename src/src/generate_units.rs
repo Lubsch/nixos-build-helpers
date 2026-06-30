@@ -1,9 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::{self, create_dir_all, read_link, remove_file};
 use std::io::ErrorKind::AlreadyExists;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -19,7 +19,7 @@ struct Unit {
     #[serde(rename = "upheldBy")]
     upheld_by: Vec<String>,
     #[serde(rename = "requiredBy")]
-    required_by: Vec<String>
+    required_by: Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -57,8 +57,8 @@ fn lnf(original: &Path, link: &Path) -> std::io::Result<()> {
         Err(ref e) if e.kind() == AlreadyExists => {
             remove_file(link)?;
             symlink(original, link)
-        },
-        x => x
+        }
+        x => x,
     }
 }
 
@@ -87,7 +87,8 @@ fn lndir(src: &Path, dst: &Path) -> std::io::Result<()> {
 pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
     let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
     let config_bytes = fs::read(config_path).context("Config isn't accessible")?;
-    let mut config: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&config_bytes).context("Config is invalid")?;
+    let mut config: BTreeMap<String, serde_json::Value> =
+        serde_json::from_slice(&config_bytes).context("Config is invalid")?;
     let args: Args = serde_json::from_value(config.remove("generate-units-args").unwrap()).unwrap();
 
     let type_dir = match args.units_type.as_str() {
@@ -95,7 +96,7 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
         "initrd" => Path::new("system"),
         "user" => Path::new("user"),
         "nspawn" => Path::new("nspawn"),
-        _ => panic!("type must be one of system | initrd | user | nspawn")
+        _ => panic!("type must be one of system | initrd | user | nspawn"),
     };
 
     let out: PathBuf = std::env::var("out").unwrap().into();
@@ -105,7 +106,11 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
     std::fs::create_dir_all(&out)?;
 
     for unit in args.upstream_units {
-        let p = &args.package.join("example/systemd").join(type_dir).join(unit);
+        let p = &args
+            .package
+            .join("example/systemd")
+            .join(type_dir)
+            .join(unit);
         let Ok(meta) = p.symlink_metadata() else {
             panic!("missing {p:?}");
         };
@@ -122,7 +127,11 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
     }
 
     for unit in args.upstream_wants {
-        let p = &args.package.join("example/systemd").join(type_dir).join(unit);
+        let p = &args
+            .package
+            .join("example/systemd")
+            .join(type_dir)
+            .join(unit);
         if !p.exists() {
             panic!("missing {p:?}");
         };
@@ -142,27 +151,31 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
     for pkg in args.packages {
         let (pkg, type_dir) = (pkg.to_str().unwrap(), type_dir.to_str().unwrap());
 
-        for p in glob::glob(&format!("{pkg}/etc/systemd/{type_dir}/*")).unwrap()
-            .chain(glob::glob(&format!("{pkg}/lib/systemd/{type_dir}/*")).unwrap()) {
+        for p in glob::glob(&format!("{pkg}/etc/systemd/{type_dir}/*"))
+            .unwrap()
+            .chain(glob::glob(&format!("{pkg}/lib/systemd/{type_dir}/*")).unwrap())
+        {
+            let p = p.unwrap();
+            if p.file_name().unwrap().to_str().unwrap().ends_with(".wants") {
+                continue;
+            }
+            if p.is_dir() {
+                let target_dir = out.join(p.file_name().unwrap());
+                create_dir_all(target_dir)?;
 
-                let p = p.unwrap();
-                if p.file_name().unwrap().to_str().unwrap().ends_with(".wants") {
-                    continue;
-                }
-                if p.is_dir() {
-                    let target_dir = out.join(p.file_name().unwrap());
-                    create_dir_all(target_dir)?;
-
-                    lndir(&p, &out.join(p.file_name().unwrap()))?;
-                } else {
-                    symlink(&p, out.join(p.file_name().unwrap()))?;
-                }
+                lndir(&p, &out.join(p.file_name().unwrap()))?;
+            } else {
+                symlink(&p, out.join(p.file_name().unwrap()))?;
+            }
         }
     }
 
-    for u in args.units.values()
-        .filter(|u| matches!(u.override_strategy.as_deref(), Some("asDropinIfExists") | None)) {
-
+    for u in args.units.values().filter(|u| {
+        matches!(
+            u.override_strategy.as_deref(),
+            Some("asDropinIfExists") | None
+        )
+    }) {
         // There's guaranteed to be a unit file in there
         let p = &u.unit.read_dir()?.next().unwrap()?.path();
         let p = p.file_name().unwrap();
@@ -185,9 +198,11 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
         }
     }
 
-    for u in args.units.values()
-        .filter(|u| matches!(u.override_strategy.as_deref(), Some("asDropin"))) {
-
+    for u in args
+        .units
+        .values()
+        .filter(|u| matches!(u.override_strategy.as_deref(), Some("asDropin")))
+    {
         let p = &u.unit.read_dir()?.next().unwrap()?.path();
         let p = p.file_name().unwrap();
 
@@ -235,7 +250,10 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
         symlink(args.default_unit, out.join("default.target"))?;
         symlink(args.ctrl_alt_del_unit, out.join("ctrl-alt-del.target"))?;
 
-        symlink("../remote-fs.target", out.join("multi-user.target.wants/remote-fs.target"))?;
+        symlink(
+            "../remote-fs.target",
+            out.join("multi-user.target.wants/remote-fs.target"),
+        )?;
     }
 
     Ok(())

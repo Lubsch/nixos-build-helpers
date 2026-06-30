@@ -69,7 +69,7 @@ impl ComposefsPath {
         mode: &str,
         payload: &str,
         path: Option<PathBuf>,
-        content: Option<String>
+        content: Option<String>,
     ) -> Self {
         assert!(
             matches!(mode.len(), 3 | 4) && u32::from_str_radix(mode, 8).is_ok(),
@@ -106,7 +106,7 @@ impl ComposefsPath {
             &self.content,
             &self.digest,
         ]
-            .join(" ")
+        .join(" ")
     }
 }
 
@@ -116,7 +116,7 @@ fn dump_short_escapes(b: u8) -> Option<&'static str> {
         b'\n' => Some("\\n"),
         b'\r' => Some("\\r"),
         b'\t' => Some("\\t"),
-        _ => None
+        _ => None,
     }
 }
 
@@ -188,7 +188,7 @@ fn add_leading_directories(
             "0755",
             "-",
             Some(component.clone()),
-            None
+            None,
         );
         paths.insert(component, composefs_path);
     }
@@ -196,8 +196,7 @@ fn add_leading_directories(
 
 pub fn run(mut _args: Args) -> anyhow::Result<()> {
     let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
-    let config_bytes =
-        fs::read(config_path).context("Config isn't accessible")?;
+    let config_bytes = fs::read(config_path).context("Config isn't accessible")?;
     let mut config: BTreeMap<String, Value> =
         serde_json::from_slice(&config_bytes).context("Config is invalid")?;
     let mut config: Vec<Attrs> = serde_json::from_value(config.remove("etc'").unwrap()).unwrap();
@@ -227,7 +226,7 @@ pub fn run(mut _args: Args) -> anyhow::Result<()> {
                     "0777",
                     glob_source.to_str().unwrap(),
                     Some(glob_target.clone()),
-                    None
+                    None,
                 );
                 paths.insert(glob_target.clone(), composefs_path);
                 add_leading_directories(&glob_target, attrs, &mut paths);
@@ -247,15 +246,7 @@ pub fn run(mut _args: Args) -> anyhow::Result<()> {
                     } else {
                         String::from("-")
                     };
-                    ComposefsPath::new(
-                        attrs,
-                        size,
-                        FileType::File,
-                        mode,
-                        "-",
-                        None,
-                        Some(content),
-                    )
+                    ComposefsPath::new(attrs, size, FileType::File, mode, "-", None, Some(content))
                 } else {
                     ComposefsPath::new(
                         attrs,
@@ -265,7 +256,7 @@ pub fn run(mut _args: Args) -> anyhow::Result<()> {
                         // payload needs to be relative path in this case
                         target.to_str().unwrap().strip_prefix("/").unwrap(),
                         None,
-                        None
+                        None,
                     )
                 }
             };
