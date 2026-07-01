@@ -5,62 +5,82 @@
   nixpkgs,
 }:
 let
-  reference = nixpkgs.lib.nixosSystem {
-    inherit (stdenv.hostPlatform) system;
-    modules = [
-      {
-        system.stateVersion = "26.05";
-      }
-    ];
+  etc-units = {
+    reference = nixpkgs.lib.nixosSystem {
+      inherit (stdenv.hostPlatform) system;
+      modules = [
+        {
+          system.stateVersion = "26.05";
+        }
+      ];
+    };
+    test = nixpkgs.lib.nixosSystem {
+      inherit (stdenv.hostPlatform) system;
+      modules = [
+        ./module.nix
+        {
+          nixosBuildHelpers.etc = true;
+          nixosBuildHelpers.systemdUnits = true;
+          system.stateVersion = "26.05";
+        }
+      ];
+    };
   };
 
-  test-etc-units = nixpkgs.lib.nixosSystem {
-    inherit (stdenv.hostPlatform) system;
-    modules = [
-      ./module.nix
-      {
-        nixosBuildHelpers.etc = true;
-        nixosBuildHelpers.systemdUnits = true;
-        system.stateVersion = "26.05";
-      }
-    ];
+  overlay = {
+    reference = nixpkgs.lib.nixosSystem {
+      inherit (stdenv.hostPlatform) system;
+      modules = [
+        {
+          system.stateVersion = "26.05";
+          system.etc.overlay.enable = true;
+        }
+      ];
+    };
+
+    test = nixpkgs.lib.nixosSystem {
+      inherit (stdenv.hostPlatform) system;
+      modules = [
+        ./module.nix
+        {
+          system.stateVersion = "26.05";
+          system.etc.overlay.enable = true;
+          nixosBuildHelpers.etcOverlay = true;
+        }
+      ];
+    };
   };
 
-  reference-overlay = nixpkgs.lib.nixosSystem {
-    inherit (stdenv.hostPlatform) system;
-    modules = [
-      {
-        system.stateVersion = "26.05";
-        system.etc.overlay.enable = true;
-      }
-    ];
+  system-path = {
+    test = nixpkgs.lib.nixosSystem {
+      inherit (stdenv.hostPlatform) system;
+      modules = [
+        ./module.nix
+        {
+          system.stateVersion = "26.05";
+          nixosBuildHelpers.buildEnv = true;
+        }
+      ];
+    };
   };
 
-  test-overlay = nixpkgs.lib.nixosSystem {
-    inherit (stdenv.hostPlatform) system;
-    modules = [
-      ./module.nix
-      {
-        system.stateVersion = "26.05";
-        system.etc.overlay.enable = true;
-        nixosBuildHelpers.etcOverlay = true;
-      }
-    ];
-  };
 in
 runCommand "smoke-tests"
   {
     nativeBuildInputs = [ diffutils ];
     passthru = {
-      inherit reference test-etc-units reference-overlay test-overlay;
+      inherit etc-units overlay;
     };
   }
   ''
     touch $out # otherwise build always fails
 
     # compares /etc and system-units (which are also placed inside /etc)
-    diff -r ${reference.config.system.build.etc} ${test-etc-units.config.system.build.etc}
+    diff -r ${etc-units.reference.config.system.build.etc} ${etc-units.test.config.system.build.etc}
 
     # compares content of metadataImage
-    diff ${reference-overlay.config.system.build.etcMetadataImage} ${test-overlay.config.system.build.etcMetadataImage}
+    diff ${overlay.reference.config.system.build.etcMetadataImage} ${overlay.test.config.system.build.etcMetadataImage}
+
+    # compares content of system path (/run/current-system/sw)
+    diff ${etc-units.reference.config.system.path} ${system-path.test.config.system.path}
   ''
