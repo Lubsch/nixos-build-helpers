@@ -15,9 +15,23 @@ in
     etcOverlay = lib.mkEnableOption "NixOS build helper for etc";
     systemdUnits = lib.mkEnableOption "NixOS build helper for systemd units";
     buildEnv = lib.mkEnableOption "Nixos build helper to build system path quicker";
+    fixDependencies = lib.mkEnableOption "Make etc not depend on system-path";
   };
 
   config = {
+
+    services.dbus.packages = lib.mkIf (cfg.fixDependencies) (
+      lib.mkForce [
+        config.services.dbus.dbusPackage
+        { outPath = "/run/current-system/sw"; }
+      ]
+    );
+
+    environment.etc.terminfo = lib.mkIf (cfg.fixDependencies) (
+      lib.mkForce {
+        source = "${pkgs.ncurses}/share/terminfo";
+      }
+    );
 
     system.path = lib.mkIf cfg.buildEnv (
       lib.mkForce (
