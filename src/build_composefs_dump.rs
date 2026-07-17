@@ -96,7 +96,7 @@ impl ComposefsPath {
         [
             self.path.to_str().unwrap(),
             &self.size.to_string(),
-            &format!("{}{:04}", self.filetype, self.mode),
+            &format!("{}{:0>4}", self.filetype, self.mode),
             &self.nlink.to_string(),
             &self.uid,
             &self.gid,
@@ -145,7 +145,7 @@ fn normalize_path(path: &Path) -> std::io::Result<PathBuf> {
     path::absolute(Path::new("/").join(path))
 }
 
-/// Return the leading directories of path
+/// Return the leading directories of `path`
 fn leading_directories(path: &Path) -> Vec<PathBuf> {
     let mut parents: Vec<_> = path
         .ancestors()
@@ -221,7 +221,7 @@ pub fn run(mut _args: Args) -> anyhow::Result<()> {
 
                 let composefs_path = ComposefsPath::new(
                     attrs,
-                    100,
+                    100, // a high approximation for the size of a symlink
                     FileType::Symlink,
                     "0777",
                     glob_source.to_str().unwrap(),
