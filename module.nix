@@ -20,6 +20,9 @@ in
 
   config = {
 
+    # avoid garbage collection which would make offline rebuilds impossible
+    system.extraDependencies = [ nixos-build-helpers ];
+
     services.dbus.packages = lib.mkIf (cfg.fixDependencies) (
       lib.mkForce [
         config.services.dbus.dbusPackage
