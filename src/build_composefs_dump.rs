@@ -12,13 +12,19 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use serde_json::Value;
+use nanoserde::DeJson;
 
 const INLINE_CONTENT_MAX: u64 = 4096;
 
-#[derive(serde::Deserialize)]
+#[derive(DeJson)]
+struct Config {
+    #[nserde(rename = "etc'")]
+    etc: Vec<Attrs>
+}
+
+#[derive(DeJson)]
 struct Attrs {
-    target: PathBuf,
+    target: String,
     source: String,
     mode: String,
     uid: u64,
@@ -47,7 +53,7 @@ impl std::fmt::Display for FileType {
 }
 
 struct ComposefsPath {
-    path: PathBuf,
+    path: String,
     size: u64,
     filetype: FileType,
     mode: String,
@@ -68,7 +74,7 @@ impl ComposefsPath {
         filetype: FileType,
         mode: &str,
         payload: &str,
-        path: Option<PathBuf>,
+        path: Option<String>,
         content: Option<String>,
     ) -> Self {
         assert!(
@@ -94,7 +100,7 @@ impl ComposefsPath {
     }
     fn write_line(&self) -> String {
         [
-            self.path.to_str().unwrap(),
+            self.path.as_str(),
             &self.size.to_string(),
             &format!("{}{:0>4}", self.filetype, self.mode),
             &self.nlink.to_string(),
@@ -175,11 +181,11 @@ fn test_leading_directories() {
 /// the dump file. Given the path "alsa/conf.d/50-pipewire.conf", for example,
 /// this function adds "alsa" and "alsa/conf.d" to the composefs paths.
 fn add_leading_directories(
-    target: &Path,
+    target: &str,
     attrs: &Attrs,
-    paths: &mut BTreeMap<PathBuf, ComposefsPath>,
+    paths: &mut BTreeMap<String, ComposefsPath>,
 ) {
-    let path_components = leading_directories(target);
+    let path_components = leading_directories(Path::new(target));
     for component in path_components {
         let composefs_path = ComposefsPath::new(
             attrs,
@@ -187,26 +193,24 @@ fn add_leading_directories(
             FileType::Directory,
             "0755",
             "-",
-            Some(component.clone()),
+            Some(component.to_str().unwrap().to_string()),
             None,
         );
-        paths.insert(component, composefs_path);
+        paths.insert(component.to_str().unwrap().to_string(), composefs_path);
     }
 }
 
 pub fn run(mut _args: Args) -> anyhow::Result<()> {
     let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
-    let config_bytes = fs::read(config_path).context("Config isn't accessible")?;
-    let mut config: BTreeMap<String, Value> =
-        serde_json::from_slice(&config_bytes).context("Config is invalid")?;
-    let mut config: Vec<Attrs> = serde_json::from_value(config.remove("etc'").unwrap()).unwrap();
+    let config_str = fs::read_to_string(config_path).context("Config isn't accessible")?;
+    let mut config: Config = Config::deserialize_json(&config_str).context("Config is invalid")?;
 
     eprintln!("Building composefs dump...");
 
-    let mut paths: BTreeMap<PathBuf, ComposefsPath> = BTreeMap::new();
+    let mut paths: BTreeMap<String, ComposefsPath> = BTreeMap::new();
 
-    for attrs in &mut config {
-        attrs.target = normalize_path(&attrs.target)?;
+    for attrs in &mut config.etc {
+        attrs.target = normalize_path(Path::new(&attrs.target))?.to_str().unwrap().to_string();
 
         let target = &attrs.target;
         let source = &attrs.source;
@@ -217,7 +221,7 @@ pub fn run(mut _args: Args) -> anyhow::Result<()> {
             for glob_source in glob_sources {
                 let glob_source = glob_source?;
                 let basename = glob_source.file_name().unwrap();
-                let glob_target = target.join(basename);
+                let glob_target = Path::new(target).join(basename).to_str().unwrap().to_string();
 
                 let composefs_path = ComposefsPath::new(
                     attrs,
@@ -254,7 +258,7 @@ pub fn run(mut _args: Args) -> anyhow::Result<()> {
                         FileType::File,
                         mode,
                         // payload needs to be relative path in this case
-                        target.to_str().unwrap().strip_prefix("/").unwrap(),
+                        target.strip_prefix("/").unwrap(),
                         None,
                         None,
                     )

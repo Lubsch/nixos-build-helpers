@@ -6,38 +6,44 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use serde::Deserialize;
+use nanoserde::DeJson;
 
-#[derive(Deserialize, Debug)]
+#[derive(DeJson, Debug)]
+struct Config {
+    #[nserde(rename = "generate-units-args")]
+    generate_units_args: Args,
+}
+
+#[derive(DeJson, Debug)]
 struct Unit {
-    unit: PathBuf,
-    #[serde(rename = "overrideStrategy")]
+    unit: String,
+    #[nserde(rename = "overrideStrategy")]
     override_strategy: Option<String>,
     aliases: Vec<String>,
-    #[serde(rename = "wantedBy")]
+    #[nserde(rename = "wantedBy")]
     wanted_by: Vec<String>,
-    #[serde(rename = "upheldBy")]
+    #[nserde(rename = "upheldBy")]
     upheld_by: Vec<String>,
-    #[serde(rename = "requiredBy")]
+    #[nserde(rename = "requiredBy")]
     required_by: Vec<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(DeJson, Debug)]
 struct Args {
-    #[serde(rename = "allowCollisions")]
+    #[nserde(rename = "allowCollisions")]
     allow_collisions: bool,
-    #[serde(rename = "type")]
+    #[nserde(rename = "type")]
     units_type: String,
     units: BTreeMap<String, Unit>,
-    #[serde(rename = "upstreamUnits")]
+    #[nserde(rename = "upstreamUnits")]
     upstream_units: Vec<String>,
-    #[serde(rename = "upstreamWants")]
+    #[nserde(rename = "upstreamWants")]
     upstream_wants: Vec<String>,
-    packages: BTreeSet<PathBuf>,
-    package: PathBuf,
-    #[serde(rename = "defaultUnit")]
+    packages: BTreeSet<String>,
+    package: String,
+    #[nserde(rename = "defaultUnit")]
     default_unit: String,
-    #[serde(rename = "ctrlAltDelUnit")]
+    #[nserde(rename = "ctrlAltDelUnit")]
     ctrl_alt_del_unit: String,
 }
 
@@ -86,10 +92,9 @@ fn lndir(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
     let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
-    let config_bytes = fs::read(config_path).context("Config isn't accessible")?;
-    let mut config: BTreeMap<String, serde_json::Value> =
-        serde_json::from_slice(&config_bytes).context("Config is invalid")?;
-    let args: Args = serde_json::from_value(config.remove("generate-units-args").unwrap()).unwrap();
+    let config_str = fs::read_to_string(config_path).context("Config isn't accessible")?;
+    let config = Config::deserialize_json(&config_str).context("Config is invalid")?;
+    let args = config.generate_units_args;
 
     let type_dir = match args.units_type.as_str() {
         "system" => Path::new("system"),
@@ -106,8 +111,7 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
     std::fs::create_dir_all(&out)?;
 
     for unit in args.upstream_units {
-        let p = &args
-            .package
+        let p = Path::new(&args.package)
             .join("example/systemd")
             .join(type_dir)
             .join(unit);
@@ -115,20 +119,19 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
             panic!("missing {p:?}");
         };
         if meta.is_symlink() {
-            let target = read_link(p)?;
+            let target = read_link(&p)?;
             if target.iter().next() == Some(OsStr::new("..")) {
-                symlink(p, out.join(p.file_name().unwrap()))?;
+                symlink(&p, out.join(p.file_name().unwrap()))?;
             } else {
-                copy_no_deref(p, &out.join(p.file_name().unwrap()))?
+                copy_no_deref(&p, &out.join(p.file_name().unwrap()))?
             }
         } else {
-            symlink(p, out.join(p.file_name().unwrap()))?;
+            symlink(&p, out.join(p.file_name().unwrap()))?;
         }
     }
 
     for unit in args.upstream_wants {
-        let p = &args
-            .package
+        let p = Path::new(&args.package)
             .join("example/systemd")
             .join(type_dir)
             .join(unit);
@@ -149,7 +152,7 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
     }
 
     for pkg in args.packages {
-        let (pkg, type_dir) = (pkg.to_str().unwrap(), type_dir.to_str().unwrap());
+        let (pkg, type_dir) = (pkg, type_dir.to_str().unwrap());
 
         for p in glob::glob(&format!("{pkg}/etc/systemd/{type_dir}/*"))
             .unwrap()
@@ -177,24 +180,25 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
         )
     }) {
         // There's guaranteed to be a unit file in there
-        let p = &u.unit.read_dir()?.next().unwrap()?.path();
+        let unit = Path::new(&u.unit);
+        let p = unit.read_dir()?.next().unwrap()?.path();
         let p = p.file_name().unwrap();
         let mut p_out = out.join(p);
         if p_out.exists() {
-            if u.unit.join(p).canonicalize()? == Path::new("/dev/null") {
+            if unit.join(p).canonicalize()? == Path::new("/dev/null") {
                 remove_file(&p_out)?;
                 symlink(Path::new("/dev/null"), p_out)?;
             } else {
                 if args.allow_collisions {
                     p_out.as_mut_os_string().push(".d");
                     create_dir_all(&p_out)?;
-                    symlink(u.unit.join(p), p_out.join("overrides.conf"))?;
+                    symlink(unit.join(p), p_out.join("overrides.conf"))?;
                 } else {
                     panic!("Found multiple derivations configuring {:?}", u.unit);
                 }
             }
         } else {
-            symlink(u.unit.join(p), p_out)?;
+            symlink(unit.join(p), p_out)?;
         }
     }
 
@@ -203,13 +207,14 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
         .values()
         .filter(|u| matches!(u.override_strategy.as_deref(), Some("asDropin")))
     {
-        let p = &u.unit.read_dir()?.next().unwrap()?.path();
+        let unit = Path::new(&u.unit);
+        let p = unit.read_dir()?.next().unwrap()?.path();
         let p = p.file_name().unwrap();
 
         let mut p_out = out.join(p);
         p_out.as_mut_os_string().push(".d");
         create_dir_all(&p_out)?;
-        symlink(u.unit.join(p), p_out.join("overrides.conf"))?;
+        symlink(unit.join(p), p_out.join("overrides.conf"))?;
     }
 
     for (name, u) in &args.units {

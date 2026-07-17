@@ -1,17 +1,25 @@
 use anyhow::Context;
 use glob::glob;
-use std::collections::BTreeMap;
+use nanoserde::DeJson;
+
+use std::fs::read_to_string;
 use std::{
     env::{self, Args},
-    fs::{create_dir_all, read, read_link, write},
+    fs::{create_dir_all, read_link, write},
     os::unix::fs::symlink,
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, DeJson)]
+struct Config {
+    #[nserde(rename = "etc'")]
+    etc: Vec<Entry>
+}
+
+#[derive(Debug, DeJson)]
 struct Entry {
-    source: PathBuf,
-    target: PathBuf,
+    source: String,
+    target: String,
     mode: String,
     user: String,
     group: String,
@@ -20,9 +28,9 @@ struct Entry {
 fn make_etc_entry(entry: Entry, etc: &Path) -> anyhow::Result<()> {
     let target = etc.join(entry.target);
 
-    if entry.source.to_str().context("")?.contains('*') {
+    if entry.source.contains('*') {
         create_dir_all(&target)?;
-        for entry in glob(entry.source.to_str().context("")?)? {
+        for entry in glob(&entry.source)? {
             let entry = entry?;
             let target = target.join(entry.file_name().context("")?);
             symlink(&entry, target)?;
@@ -56,10 +64,9 @@ fn make_etc_entry(entry: Entry, etc: &Path) -> anyhow::Result<()> {
 
 pub fn run(mut _args: Args) -> anyhow::Result<()> {
     let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
-    let config_bytes = read(config_path).context("Config isn't accessible")?;
-    let mut config: BTreeMap<String, serde_json::Value> =
-        serde_json::from_slice(&config_bytes).context("Config is invalid")?;
-    let entries: Vec<Entry> = serde_json::from_value(config.remove("etc'").unwrap()).unwrap();
+    let config_str = read_to_string(config_path).context("Config isn't accessible")?;
+    let config = Config::deserialize_json(&config_str).context("Config is invalid")?;
+    let entries = config.etc;
 
     let etc = PathBuf::from(env::var("out")?).join("etc");
     create_dir_all(&etc)?;

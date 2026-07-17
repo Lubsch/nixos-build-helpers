@@ -6,12 +6,43 @@ use std::{
 };
 
 use anyhow::Context as _;
-use serde::Deserialize;
+use nanoserde::DeJson;
+
+#[derive(Debug, DeJson)]
+struct Outputs {
+    out: String,
+}
+
+#[derive(Debug, DeJson)]
+struct ChosenOutput {
+    paths: Vec<String>,
+    priority: i32,
+}
+
+#[derive(Debug, DeJson)]
+struct Args {
+    outputs: Outputs,
+    #[nserde(rename = "extraPrefix")]
+    extra_prefix: String,
+    #[nserde(rename = "pathsToLink")]
+    paths_to_link: Vec<String>,
+    #[nserde(rename = "ignoreCollisions")]
+    ignore_collisions: bool,
+    #[nserde(rename = "checkCollisionContents")]
+    check_collision_contents: bool,
+    #[nserde(rename = "ignoreSingleFileOutputs")]
+    ignore_single_file_outputs: bool,
+    #[nserde(rename = "chosenOutputs")]
+    chosen_outputs: Vec<ChosenOutput>,
+    #[nserde(rename = "extraPathsFrom")]
+    extra_paths_from: String,
+    manifest: String,
+}
 
 #[derive(Default)]
 struct Discovery {
-    done: BTreeSet<PathBuf>,
-    postponed: BTreeSet<PathBuf>,
+    done: BTreeSet<String>,
+    postponed: BTreeSet<String>,
     roots: Vec<Root>,
 }
 
@@ -23,31 +54,6 @@ enum IgnoreCollisions {
     True,
     False,
     TrueDontWarn,
-}
-
-#[derive(Debug, Deserialize)]
-struct Outputs {
-    out: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChosenOutput {
-    paths: Vec<PathBuf>,
-    priority: i32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Args {
-    outputs: Outputs,
-    extra_prefix: String,
-    paths_to_link: Vec<String>,
-    ignore_collisions: bool,
-    check_collision_contents: bool,
-    ignore_single_file_outputs: bool,
-    chosen_outputs: Vec<ChosenOutput>,
-    extra_paths_from: PathBuf,
-    manifest: PathBuf,
 }
 
 // One package's contribution at a single rel_name.
@@ -119,7 +125,7 @@ fn check_collision(a: &Path, b: &Path) -> anyhow::Result<bool> {
 
 // A genuine file/file collision: ignore / check-contents / die.
 // `policy` is the *rival's* policy, matching the Perl which evaluates the
-// collision under the flag of the contributor currently being merged in.
+// collision under the flag of the contributor currently being merged in
 fn handle_collision(
     a: &Contribution,
     b: &Contribution,
@@ -151,7 +157,7 @@ fn handle_collision(
 }
 
 // Shallow-read one directory: stat each child, no descent.
-// Pure I/O on `target` only — no shared state; becomes par_iter later.
+// Pure I/O on `target` only, no shared state, becomes par_iter later
 fn read_level(
     rel_name: &str,
     target: &Path,
@@ -202,7 +208,7 @@ fn resolve(
 
     let winner = &contribs[0];
 
-    // Case 1: winner is a file — it shadows everything; single symlink.
+    // winner is a file: it shadows everything, single symlink.
     if !winner.is_dir {
         // Evaluate each same-priority rival against the winner, under the
         // rival's own policy (propagated rivals stay silent).
@@ -218,12 +224,12 @@ fn resolve(
     // lower-priority files are shadowed and dropped.
     let dirs = contribs.iter().filter(|c| c.is_dir);
 
-    // Case 2: exactly one directory — link it whole, don't descend (laziness).
+    // exactly one directory: link it whole, don't descend (laziness).
     if dirs.clone().count() == 1 {
         return Ok((Resolution::Symlink(winner.target.clone()), None));
     }
 
-    // Case 3: multiple directories must merge — real dir, descend into each.
+    // multiple directories must merge: real dir, descend into each.
     let to_descend = dirs
         .map(|c| (c.target.clone(), c.priority, c.ignore_collisions))
         .collect();
@@ -288,15 +294,18 @@ fn build_symlinks(
 // Append a package root if not already seen; queue its propagated packages.
 fn discover_root(
     d: &mut Discovery,
-    pkg_dir: &Path,
+    pkg_dir: &str,
     priority: i32,
     policy: IgnoreCollisions,
     store_dir: &Path,
     ignore_single_file_outputs: bool,
 ) -> anyhow::Result<()> {
-    if !d.done.insert(pkg_dir.to_path_buf()) {
+
+    if !d.done.insert(pkg_dir.to_string()) {
         return Ok(());
     }
+
+    let pkg_dir = Path::new(pkg_dir);
     // A store path that is a plain file can't be merged.
     if pkg_dir.is_file() && pkg_dir.starts_with(store_dir) {
         if ignore_single_file_outputs {
@@ -311,9 +320,8 @@ fn discover_root(
     let propagated = pkg_dir.join("nix-support/propagated-user-env-packages");
     if let Ok(content) = fs::read_to_string(&propagated) {
         for p in content.split_whitespace() {
-            let p = PathBuf::from(p);
-            if !d.done.contains(&p) {
-                d.postponed.insert(p);
+            if !d.done.contains(p) {
+                d.postponed.insert(p.to_string());
             }
         }
     }
@@ -323,8 +331,8 @@ fn discover_root(
 pub fn run(mut _args_iter: std::env::Args) -> anyhow::Result<()> {
     let config_path = std::env::var("NIX_ATTRS_JSON_FILE").unwrap();
     // let config_path = args_iter.next().context("supply JSON config as arg")?;
-    let config_bytes = fs::read(config_path).context("cannot open structured attrs JSON file")?;
-    let args: Args = serde_json::from_slice(&config_bytes).context("config is invalid")?;
+    let config = fs::read_to_string(config_path).context("cannot open structured attrs JSON file")?;
+    let args: Args = Args::deserialize_json(&config).context("config is invalid")?;
 
     // TODO get caller supplied
     let store_dir =
@@ -337,10 +345,10 @@ pub fn run(mut _args_iter: std::env::Args) -> anyhow::Result<()> {
         IgnoreCollisions::False
     };
 
-    // Phase 1: explicitly chosen packages, under the user's collision policy.
+    // explicitly chosen packages, under the user's collision policy.
     for pkg in &args.chosen_outputs {
         for path in &pkg.paths {
-            if path.try_exists()? {
+            if Path::new(path).try_exists()? {
                 discover_root(
                     &mut d,
                     path,
@@ -353,13 +361,13 @@ pub fn run(mut _args_iter: std::env::Args) -> anyhow::Result<()> {
         }
     }
 
-    // Phase 2: propagated packages, lower priority, collisions always silent.
-    // Priority is assigned by sorted order so it's deterministic regardless
+    // propagated packages, lower priority, collisions always silent
+    // priority is assigned by sorted order so it's deterministic regardless
     // of discovery order.
     let mut priority = 1000;
     while !d.postponed.is_empty() {
-        let batch: Vec<PathBuf> = std::mem::take(&mut d.postponed).into_iter().collect();
-        // BTreeSet iterates sorted; collect preserves that order.
+        let batch: Vec<String> = std::mem::take(&mut d.postponed).into_iter().collect();
+        // BTreeSet iterates sorted, collect preserves that order.
         for pkg in batch {
             discover_root(
                 &mut d,
@@ -373,13 +381,12 @@ pub fn run(mut _args_iter: std::env::Args) -> anyhow::Result<()> {
         }
     }
 
-    // Phase 3: extra paths from a file (directories only), priority 1000.
-    if args.extra_paths_from != Path::new("") {
+    // extra paths from a file (directories only), priority 1000.
+    if !args.extra_paths_from.is_empty() {
         let content = fs::read_to_string(&args.extra_paths_from)
             .with_context(|| format!("cannot open extra paths file {:?}", args.extra_paths_from))?;
-        for line in content.lines() {
-            let pkg = Path::new(line);
-            if pkg.is_dir() {
+        for pkg in content.lines() {
+            if Path::new(pkg).is_dir() {
                 discover_root(
                     &mut d,
                     pkg,
@@ -392,12 +399,12 @@ pub fn run(mut _args_iter: std::env::Args) -> anyhow::Result<()> {
         }
     }
 
-    // Walk all roots and resolve into the final symlink map.
+    // walk all roots and resolve into the final symlink map.
     let resolutions = build_symlinks(d.roots, &args.paths_to_link, args.check_collision_contents)?;
 
-    // Realize: BTreeMap order guarantees parents precede children.
+    // realize, btreemap order guarantees parents precede children.
 
-    let base = args.outputs.out.join(&args.extra_prefix);
+    let base = Path::new(&args.outputs.out).join(&args.extra_prefix);
     let abs = |rel: &str| base.join(rel.strip_prefix('/').unwrap_or(rel));
 
     let mut nr_links = 0;
@@ -413,8 +420,8 @@ pub fn run(mut _args_iter: std::env::Args) -> anyhow::Result<()> {
 
     eprintln!("created {nr_links} symlinks in user environment");
 
-    if args.manifest != Path::new("") {
-        symlink(&args.manifest, args.outputs.out.join("manifest"))
+    if !args.manifest.is_empty() {
+        symlink(&args.manifest, Path::new(&args.outputs.out).join("manifest"))
             .context("cannot create manifest")?;
     }
 
