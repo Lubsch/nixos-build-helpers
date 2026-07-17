@@ -14,10 +14,10 @@ fn main() -> Result<()> {
         .with_context(|| anyhow!("Missing command argument\n{COMMANDS}"))?;
 
     match command.as_str() {
-        "build-composefs-dump" => build_composefs_dump::run(args),
-        "build-etc" => build_etc::run(args),
-        "generate-units" => generate_units::run(args),
-        "build-env" => build_env::run(args),
+        "build-composefs-dump" => build_composefs_dump::run(),
+        "build-etc" => build_etc::run(),
+        "generate-units" => generate_units::run(),
+        "build-env" => build_env::run(),
         _ => Err(anyhow!("unknown command: \"{command}\"\n{COMMANDS}")),
     }
 }

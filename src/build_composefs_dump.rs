@@ -3,7 +3,6 @@
 //! https://github.com/containers/composefs/blob/main/man/composefs-dump.md
 
 use std::collections::BTreeMap;
-use std::env::Args;
 use std::fs;
 use std::os::linux::fs::MetadataExt as _;
 use std::os::unix::ffi::OsStrExt;
@@ -12,6 +11,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use anyhow::bail;
 use nanoserde::DeJson;
 
 const INLINE_CONTENT_MAX: u64 = 4096;
@@ -126,12 +126,12 @@ fn dump_short_escapes(b: u8) -> Option<&'static str> {
     }
 }
 
-fn escape_dump_field(data: &[u8]) -> String {
+fn escape_dump_field(data: &[u8]) -> anyhow::Result<String> {
     if data.is_empty() {
-        panic!("cannot escape empty content; emit '-' instead");
+        bail!("cannot escape empty content; emit '-' instead");
     }
     if data == b"-" {
-        return String::from("\u{2d}");
+        return Ok(String::from("\u{2d}"));
     }
     let mut out = String::new();
     for b in data {
@@ -144,22 +144,22 @@ fn escape_dump_field(data: &[u8]) -> String {
         }
     }
 
-    out
+    Ok(out)
 }
 
-fn normalize_path(path: &Path) -> std::io::Result<PathBuf> {
+fn normalize_path(path: &str) -> std::io::Result<PathBuf> {
     path::absolute(Path::new("/").join(path))
 }
 
 /// Return the leading directories of `path`
-fn leading_directories(path: &Path) -> Vec<PathBuf> {
-    let mut parents: Vec<_> = path
+fn leading_directories(path: &str) -> Vec<String> {
+    let mut parents: Vec<_> = Path::new(path)
         .ancestors()
         // remove the implicit `.` from the start of a relative path or `/` from an
         // absolute path
         .skip(1)
         .filter(|p| !matches!(p.as_os_str().as_bytes(), b"" | b"/"))
-        .map(|p: &Path| p.to_owned())
+        .map(|p: &Path| p.to_str().unwrap().to_string())
         .collect();
 
     parents.reverse();
@@ -168,10 +168,9 @@ fn leading_directories(path: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn test_leading_directories() {
-    let leading = leading_directories(Path::new("alsa/conf.d/50-pipewire.conf"));
     assert_eq!(
-        leading,
-        vec![PathBuf::from("alsa"), PathBuf::from("alsa/conf.d")]
+        leading_directories("alsa/conf.d/50-pipewire.conf"),
+        vec!["alsa", "alsa/conf.d"]
     );
 }
 
@@ -185,22 +184,21 @@ fn add_leading_directories(
     attrs: &Attrs,
     paths: &mut BTreeMap<String, ComposefsPath>,
 ) {
-    let path_components = leading_directories(Path::new(target));
-    for component in path_components {
+    for leading_dir in leading_directories(target) {
         let composefs_path = ComposefsPath::new(
             attrs,
             4096,
             FileType::Directory,
             "0755",
             "-",
-            Some(component.to_str().unwrap().to_string()),
+            Some(leading_dir.clone()),
             None,
         );
-        paths.insert(component.to_str().unwrap().to_string(), composefs_path);
+        paths.insert(leading_dir, composefs_path);
     }
 }
 
-pub fn run(mut _args: Args) -> anyhow::Result<()> {
+pub fn run() -> anyhow::Result<()> {
     let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
     let config_str = fs::read_to_string(config_path).context("Config isn't accessible")?;
     let mut config: Config = Config::deserialize_json(&config_str).context("Config is invalid")?;
@@ -210,7 +208,7 @@ pub fn run(mut _args: Args) -> anyhow::Result<()> {
     let mut paths: BTreeMap<String, ComposefsPath> = BTreeMap::new();
 
     for attrs in &mut config.etc {
-        attrs.target = normalize_path(Path::new(&attrs.target))?.to_str().unwrap().to_string();
+        attrs.target = normalize_path(&attrs.target)?.to_str().unwrap().to_string();
 
         let target = &attrs.target;
         let source = &attrs.source;
@@ -246,7 +244,7 @@ pub fn run(mut _args: Args) -> anyhow::Result<()> {
                     let content = if size > 0 {
                         let raw = fs::read(Path::new(source)).unwrap();
                         size = raw.len() as u64;
-                        escape_dump_field(&raw)
+                        escape_dump_field(&raw)?
                     } else {
                         String::from("-")
                     };

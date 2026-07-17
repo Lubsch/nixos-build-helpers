@@ -4,7 +4,7 @@ use nanoserde::DeJson;
 
 use std::fs::read_to_string;
 use std::{
-    env::{self, Args},
+    env,
     fs::{create_dir_all, read_link, write},
     os::unix::fs::symlink,
     path::{Path, PathBuf},
@@ -48,22 +48,22 @@ fn make_etc_entry(entry: Entry, etc: &Path) -> anyhow::Result<()> {
                     );
                 }
             } else {
-                println!("symlink error: {e:?}");
+                anyhow::bail!("symlink error: {e:?}");
             }
         }
 
         // NOTE differs from original that it fails here when there are duplicates
         if entry.mode != "symlink" {
-            write(target.with_extension("mode"), format!("{}\n", entry.mode))?;
-            write(target.with_extension("uid"), format!("{}\n", entry.user))?;
-            write(target.with_extension("gid"), format!("{}\n", entry.group))?;
+            write(target.with_added_extension("mode"), format!("{}\n", entry.mode))?;
+            write(target.with_added_extension("uid"), format!("{}\n", entry.user))?;
+            write(target.with_added_extension("gid"), format!("{}\n", entry.group))?;
         }
     }
     Ok(())
 }
 
-pub fn run(mut _args: Args) -> anyhow::Result<()> {
-    let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
+pub fn run() -> anyhow::Result<()> {
+    let config_path = env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
     let config_str = read_to_string(config_path).context("Config isn't accessible")?;
     let config = Config::deserialize_json(&config_str).context("Config is invalid")?;
     let entries = config.etc;

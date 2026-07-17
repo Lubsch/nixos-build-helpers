@@ -5,7 +5,7 @@ use std::io::ErrorKind::AlreadyExists;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use nanoserde::DeJson;
 
 #[derive(DeJson, Debug)]
@@ -90,7 +90,7 @@ fn lndir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
+pub fn run() -> anyhow::Result<()> {
     let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
     let config_str = fs::read_to_string(config_path).context("Config isn't accessible")?;
     let config = Config::deserialize_json(&config_str).context("Config is invalid")?;
@@ -101,7 +101,7 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
         "initrd" => Path::new("system"),
         "user" => Path::new("user"),
         "nspawn" => Path::new("nspawn"),
-        _ => panic!("type must be one of system | initrd | user | nspawn"),
+        _ => bail!("type must be one of system | initrd | user | nspawn"),
     };
 
     let out: PathBuf = std::env::var("out").unwrap().into();
@@ -116,7 +116,7 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
             .join(type_dir)
             .join(unit);
         let Ok(meta) = p.symlink_metadata() else {
-            panic!("missing {p:?}");
+            bail!("missing {p:?}");
         };
         if meta.is_symlink() {
             let target = read_link(&p)?;
@@ -136,7 +136,7 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
             .join(type_dir)
             .join(unit);
         if !p.exists() {
-            panic!("missing {p:?}");
+            bail!("missing {p:?}");
         };
         let x = &out.join(p.file_name().unwrap());
         fs::create_dir(x)?;
@@ -152,7 +152,7 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
     }
 
     for pkg in args.packages {
-        let (pkg, type_dir) = (pkg, type_dir.to_str().unwrap());
+        let type_dir = type_dir.to_str().unwrap();
 
         for p in glob::glob(&format!("{pkg}/etc/systemd/{type_dir}/*"))
             .unwrap()
@@ -194,7 +194,7 @@ pub fn run(mut _args: std::env::Args) -> anyhow::Result<()> {
                     create_dir_all(&p_out)?;
                     symlink(unit.join(p), p_out.join("overrides.conf"))?;
                 } else {
-                    panic!("Found multiple derivations configuring {:?}", u.unit);
+                    bail!("Found multiple derivations configuring {:?}", u.unit);
                 }
             }
         } else {

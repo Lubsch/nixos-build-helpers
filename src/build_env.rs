@@ -328,10 +328,10 @@ fn discover_root(
     Ok(())
 }
 
-pub fn run(mut _args_iter: std::env::Args) -> anyhow::Result<()> {
-    let config_path = std::env::var("NIX_ATTRS_JSON_FILE").unwrap();
+pub fn run() -> anyhow::Result<()> {
+    let config_path = std::env::var("NIX_ATTRS_JSON_FILE")?;
     // let config_path = args_iter.next().context("supply JSON config as arg")?;
-    let config = fs::read_to_string(config_path).context("cannot open structured attrs JSON file")?;
+    let config = fs::read_to_string(config_path).context("cannot read structured attrs JSON file")?;
     let args: Args = Args::deserialize_json(&config).context("config is invalid")?;
 
     // TODO get caller supplied
@@ -406,6 +406,8 @@ pub fn run(mut _args_iter: std::env::Args) -> anyhow::Result<()> {
 
     let base = Path::new(&args.outputs.out).join(&args.extra_prefix);
     let abs = |rel: &str| base.join(rel.strip_prefix('/').unwrap_or(rel));
+
+    fs::create_dir_all(base.parent().unwrap())?;
 
     let mut nr_links = 0;
     for (rel, res) in &resolutions {
