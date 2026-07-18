@@ -97,10 +97,10 @@ pub fn run() -> anyhow::Result<()> {
     let args = config.generate_units_args;
 
     let type_dir = match args.units_type.as_str() {
-        "system" => Path::new("system"),
-        "initrd" => Path::new("system"),
-        "user" => Path::new("user"),
-        "nspawn" => Path::new("nspawn"),
+        "system" => "system",
+        "initrd" => "system",
+        "user" => "user",
+        "nspawn" => "nspawn",
         _ => bail!("type must be one of system | initrd | user | nspawn"),
     };
 
@@ -108,7 +108,7 @@ pub fn run() -> anyhow::Result<()> {
     // let tmpdir = tempfile::tempdir()?;
     // let out: PathBuf = tmpdir.keep();
     // dbg!(&out);
-    std::fs::create_dir_all(&out)?;
+    fs::create_dir_all(&out)?;
 
     for unit in args.upstream_units {
         let p = Path::new(&args.package)
@@ -152,69 +152,56 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     for pkg in args.packages {
-        let type_dir = type_dir.to_str().unwrap();
-
-        for p in glob::glob(&format!("{pkg}/etc/systemd/{type_dir}/*"))
-            .unwrap()
-            .chain(glob::glob(&format!("{pkg}/lib/systemd/{type_dir}/*")).unwrap())
+        for p in glob::glob(&format!("{pkg}/etc/systemd/{type_dir}/*"))?
+            .chain(glob::glob(&format!("{pkg}/lib/systemd/{type_dir}/*"))?)
         {
-            let p = p.unwrap();
-            if p.file_name().unwrap().to_str().unwrap().ends_with(".wants") {
+            let p = p?;
+            if p.extension() == Some(OsStr::new("wants")) {
                 continue;
             }
+            let file_name = p.file_name().unwrap();
             if p.is_dir() {
-                let target_dir = out.join(p.file_name().unwrap());
+                let target_dir = out.join(file_name);
                 create_dir_all(target_dir)?;
 
-                lndir(&p, &out.join(p.file_name().unwrap()))?;
+                lndir(&p, &out.join(file_name))?;
             } else {
-                symlink(&p, out.join(p.file_name().unwrap()))?;
+                symlink(&p, out.join(file_name))?;
             }
         }
     }
 
-    for u in args.units.values().filter(|u| {
-        matches!(
-            u.override_strategy.as_deref(),
-            Some("asDropinIfExists") | None
-        )
-    }) {
+    for u in args.units.values() {
         // There's guaranteed to be a unit file in there
         let unit = Path::new(&u.unit);
         let p = unit.read_dir()?.next().unwrap()?.path();
         let p = p.file_name().unwrap();
-        let mut p_out = out.join(p);
-        if p_out.exists() {
-            if unit.join(p).canonicalize()? == Path::new("/dev/null") {
-                remove_file(&p_out)?;
-                symlink(Path::new("/dev/null"), p_out)?;
-            } else {
-                if args.allow_collisions {
-                    p_out.as_mut_os_string().push(".d");
-                    create_dir_all(&p_out)?;
-                    symlink(unit.join(p), p_out.join("overrides.conf"))?;
+        let p_out = out.join(p);
+        let p_out_d = p_out.with_added_extension("d");
+
+        match u.override_strategy.as_deref() {
+            Some("asDropinIfExists") | None if !p_out.exists() => {
+                symlink(unit.join(p), p_out)?;
+            }
+            Some("asDropinIfExists") | None => {
+                if unit.join(p).canonicalize()? == Path::new("/dev/null") {
+                    remove_file(&p_out)?;
+                    symlink(Path::new("/dev/null"), p_out)?;
                 } else {
-                    bail!("Found multiple derivations configuring {:?}", u.unit);
+                    if args.allow_collisions {
+                        create_dir_all(&p_out_d)?;
+                        symlink(unit.join(p), p_out_d.join("overrides.conf"))?;
+                    } else {
+                        bail!("Found multiple derivations configuring {:?}", u.unit);
+                    }
                 }
             }
-        } else {
-            symlink(unit.join(p), p_out)?;
+            Some("asDropin") => {
+                create_dir_all(&p_out_d)?;
+                symlink(unit.join(p), p_out_d.join("overrides.conf"))?;
+            }
+            Some(x) => bail!("Unknown overrideStrategy {x}")
         }
-    }
-
-    for u in args
-        .units
-        .values()
-        .filter(|u| matches!(u.override_strategy.as_deref(), Some("asDropin")))
-    {
-        let unit = Path::new(&u.unit);
-        let p = unit.read_dir()?.next().unwrap()?.path();
-        let p = p.file_name().unwrap();
-
-        let mut p_out = out.join(p);
-        p_out.as_mut_os_string().push(".d");
-        create_dir_all(&p_out)?;
-        symlink(unit.join(p), p_out.join("overrides.conf"))?;
     }
 
     for (name, u) in &args.units {
@@ -225,8 +212,7 @@ pub fn run() -> anyhow::Result<()> {
 
     for (name, u) in &args.units {
         for name2 in &u.wanted_by {
-            let mut wants = out.join(name2);
-            wants.as_mut_os_string().push(".wants");
+            let wants = out.join(name2).with_added_extension("wants");
             create_dir_all(&wants)?;
             lnf(Path::new(&format!("../{name}")), &wants.join(name))?;
         }
@@ -234,8 +220,7 @@ pub fn run() -> anyhow::Result<()> {
 
     for (name, u) in &args.units {
         for name2 in &u.upheld_by {
-            let mut upholds = out.join(name2);
-            upholds.as_mut_os_string().push(".upholds");
+            let upholds = out.join(name2).with_added_extension("upholds");
             create_dir_all(&upholds)?;
             lnf(Path::new(&format!("../{name}")), &upholds.join(name))?;
         }
@@ -243,9 +228,7 @@ pub fn run() -> anyhow::Result<()> {
 
     for (name, u) in &args.units {
         for name2 in &u.required_by {
-            // TODO DRY this everywhere
-            let mut requires = out.join(name2);
-            requires.as_mut_os_string().push(".requires");
+            let requires = out.join(name2).with_added_extension("requires");
             create_dir_all(&requires)?;
             lnf(Path::new(&format!("../{name}")), &requires.join(name))?;
         }
