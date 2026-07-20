@@ -200,7 +200,7 @@ pub fn run() -> anyhow::Result<()> {
                 create_dir_all(&p_out_d)?;
                 symlink(unit.join(p), p_out_d.join("overrides.conf"))?;
             }
-            Some(x) => bail!("Unknown overrideStrategy {x}")
+            Some(x) => bail!("Unknown overrideStrategy {x}"),
         }
     }
 

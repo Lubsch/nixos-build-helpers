@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    env,
+    fs::{self, read_to_string},
     os::unix::fs::symlink,
     path::{Path, PathBuf},
 };
@@ -39,16 +40,8 @@ struct Args {
     manifest: String,
 }
 
-#[derive(Default)]
-struct Discovery {
-    done: BTreeSet<String>,
-    postponed: BTreeSet<String>,
-    roots: Vec<Root>,
-}
-
-// Collision policy. The JSON only ever carries the user-facing bool
-// (True/False); TrueDontWarn is set in code for the propagated phase,
-// mirroring the Perl which passes ignoreCollisions = 2 there.
+// Collision policy. The JSON only carries the user-facing bool; TrueDontWarn is
+// set in code for the propagated phase, mirroring the Perl ignoreCollisions = 2.
 #[derive(Debug, Clone, Copy)]
 enum IgnoreCollisions {
     True,
@@ -56,40 +49,29 @@ enum IgnoreCollisions {
     TrueDontWarn,
 }
 
-// One package's contribution at a single rel_name.
+// A directory to walk: its real path, priority, and collision policy.
+type Root = (PathBuf, i32, IgnoreCollisions);
+
+// One package's contribution at a single child name.
 struct Contribution {
     target: PathBuf,
     priority: i32,
     is_dir: bool,
-    // Policy this contribution was walked under (explicit vs propagated).
+    dangling: bool,
     ignore_collisions: IgnoreCollisions,
 }
 
-// What a rel_name resolves to.
-#[derive(Debug)]
-enum Resolution {
-    Symlink(PathBuf),
-    Directory,
-}
-
-// A package root or sub-directory to walk, with its priority and policy.
-type Root = (PathBuf, i32, IgnoreCollisions);
-
-// One frontier item: a rel_name plus every directory contributing to it.
-struct FrontierItem {
-    rel_name: String,
-    dirs: Vec<Root>,
-}
-
-// Is `path` at or below some pathsToLink entry? (keep its subtree)
+// Is `path` at or below some pathsToLink entry? (its subtree is wanted)
+// `p == "/"` matches everything, mirroring the Perl special case.
 fn is_in_paths_to_link(paths_to_link: &[String], path: &str) -> bool {
-    paths_to_link
-        .iter()
-        .any(|p| path == p || (path.starts_with(p) && path.as_bytes().get(p.len()) == Some(&b'/')))
+    paths_to_link.iter().any(|p| {
+        p == "/"
+            || path == p
+            || (path.starts_with(p.as_str()) && path.as_bytes().get(p.len()) == Some(&b'/'))
+    })
 }
 
 // Is `path` at or above some pathsToLink entry? (must descend through it)
-// Empty path is an ancestor of everything, matching the Perl's `$path eq ""`.
 fn has_paths_to_link(paths_to_link: &[String], path: &str) -> bool {
     path.is_empty()
         || paths_to_link.iter().any(|p| {
@@ -97,20 +79,49 @@ fn has_paths_to_link(paths_to_link: &[String], path: &str) -> bool {
         })
 }
 
-// The "Urgh, hacky..." blocklist.
+// The "Urgh, hacky..." blocklist plus the pathsToLink prune.
 fn skip(paths_to_link: &[String], rel_name: &str) -> bool {
     let base = rel_name.rsplit('/').next();
     matches!(rel_name, "/propagated-build-inputs" | "/nix-support")
         || rel_name.ends_with("info/dir")
-        || (rel_name.starts_with("/share/mime")
-            && rel_name != "/share/mime"
-            && !rel_name.starts_with("/share/mime/packages"))
+        || (rel_name.starts_with("/share/mime/") && !rel_name.starts_with("/share/mime/packages"))
         || matches!(base, Some("perllocal.pod" | "log"))
         || !(has_paths_to_link(paths_to_link, rel_name)
             || is_in_paths_to_link(paths_to_link, rel_name))
 }
 
-// Compare two files byte-for-byte; permission mismatch is treated as differing.
+// pathsToLink entries plus all their ancestors (and root ""). These rel_names
+// are always realized as real directories and always descended into, so that
+// ancestors are traversed to reach their entry and empty entries still exist.
+fn forced_dirs(paths_to_link: &[String]) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    set.insert(String::new());
+    for p in paths_to_link {
+        let mut cur = String::new();
+        for part in p.split('/').filter(|s| !s.is_empty()) {
+            cur.push('/');
+            cur.push_str(part);
+            set.insert(cur.clone());
+        }
+    }
+    set
+}
+
+// (is_dir, dangling) for a surviving entry. Only called after `skip`, so pruned
+// entries are never classified; only symlinks need the follow-up stat.
+fn classify(entry: &fs::DirEntry, path: &Path) -> anyhow::Result<(bool, bool)> {
+    let ftype = entry.file_type()?;
+    Ok(if ftype.is_symlink() {
+        match fs::metadata(path) {
+            Ok(m) => (m.is_dir(), false),
+            Err(_) => (false, true), // dangling symlink: treated as a leaf
+        }
+    } else {
+        (ftype.is_dir(), false)
+    })
+}
+
+// Compare two files byte-for-byte; a permission mismatch counts as differing.
 fn check_collision(a: &Path, b: &Path) -> anyhow::Result<bool> {
     let (ap, bp) = (
         fs::metadata(a)?.permissions(),
@@ -123,308 +134,238 @@ fn check_collision(a: &Path, b: &Path) -> anyhow::Result<bool> {
     Ok(fs::read(a)? == fs::read(b)?)
 }
 
-// A genuine file/file collision: ignore / check-contents / die.
-// `policy` is the *rival's* policy, matching the Perl which evaluates the
-// collision under the flag of the contributor currently being merged in
+// A genuine file/file collision, evaluated under the rival's own policy
+// (propagated rivals stay silent).
 fn handle_collision(
-    a: &Contribution,
-    b: &Contribution,
-    policy: IgnoreCollisions,
+    winner: &Contribution,
+    rival: &Contribution,
     check_contents: bool,
 ) -> anyhow::Result<()> {
-    match policy {
+    match rival.ignore_collisions {
         IgnoreCollisions::True => {
             eprintln!(
                 "colliding subpath (ignored): {:?} and {:?}",
-                a.target, b.target
+                winner.target, rival.target
             );
             Ok(())
         }
         IgnoreCollisions::TrueDontWarn => Ok(()),
         IgnoreCollisions::False => {
-            if check_contents && check_collision(&a.target, &b.target)? {
+            if check_contents && check_collision(&winner.target, &rival.target)? {
                 Ok(())
             } else {
                 anyhow::bail!(
                     "two given paths contain a conflicting subpath:\n  {:?} and\n  {:?}\n\
                      hint: this may be caused by two different versions of the same package",
-                    a.target,
-                    b.target,
+                    winner.target,
+                    rival.target,
                 );
             }
         }
     }
 }
 
-// Shallow-read one directory: stat each child, no descent.
-// Pure I/O on `target` only, no shared state, becomes par_iter later
-fn read_level(
-    rel_name: &str,
-    target: &Path,
-    priority: i32,
-    ignore_collisions: IgnoreCollisions,
-) -> anyhow::Result<Vec<(String, Contribution)>> {
-    let Ok(entries) = fs::read_dir(target) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let child_target = target.join(&name);
-        let child_rel = [rel_name, &name.to_string_lossy()].join("/");
-
-        let ftype = entry.file_type()?;
-        let is_dir = if ftype.is_symlink() {
-            fs::metadata(&child_target)
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-        } else {
-            ftype.is_dir()
-        };
-
-        out.push((
-            child_rel,
-            Contribution {
-                target: child_target,
-                priority,
-                is_dir,
-                ignore_collisions,
-            },
-        ));
-    }
-    Ok(out)
+struct MergeContext {
+    forced: BTreeSet<String>,
+    paths_to_link: Vec<String>,
+    check_collision_contents: bool,
+    nr_links: u64,
 }
 
-// Decide a single rel_name from all its contributors.
-// Returns the resolution and, for a forced merge, the dirs to descend into.
-fn resolve(
-    mut contribs: Vec<Contribution>,
-    check_contents: bool,
-) -> anyhow::Result<(Resolution, Option<Vec<Root>>)> {
-    // Lower priority number wins; stable tiebreak on target keeps output
-    // deterministic regardless of walk order.
-    contribs.sort_by_key(|c| c.priority);
+impl MergeContext {
+    // Emit one symlink (a file leaf, a dangling leaf, or a linked-whole directory).
+    fn link_leaf(&mut self, out: &Path, target: &Path, dangling: bool) -> anyhow::Result<()> {
+        if dangling {
+            let link = fs::read_link(target).unwrap_or_default();
+            eprintln!("creating dangling symlink `{out:?}' -> `{target:?}' -> `{link:?}'");
+        }
+        symlink(target, out)?;
+        self.nr_links += 1;
+        Ok(())
+    }
 
-    let winner = &contribs[0];
+    // Depth-first merge of `dirs` into `out_dir` (which already exists). Creates
+    // symlinks at leaves and directories on descent, in one pass.
+    fn merge(&mut self, rel_name: &str, out_dir: &Path, dirs: &[Root]) -> anyhow::Result<()> {
+        // directories may collide; gather all contributions per child name, then resolve by priority.
+        let mut by_name: BTreeMap<String, Vec<Contribution>> = BTreeMap::new();
+        for &(ref target, priority, ignore_collisions) in dirs {
+            for entry in fs::read_dir(target)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name
+                    .to_str()
+                    .with_context(|| format!("non-UTF-8 filename under {target:?}: {name:?}"))?;
+                let child_rel = [rel_name, name].join("/");
 
-    // winner is a file: it shadows everything, single symlink.
-    if !winner.is_dir {
-        // Evaluate each same-priority rival against the winner, under the
-        // rival's own policy (propagated rivals stay silent).
-        for rival in contribs.iter().skip(1) {
-            if rival.priority == winner.priority && rival.target != winner.target {
-                handle_collision(winner, rival, rival.ignore_collisions, check_contents)?;
+                if skip(&self.paths_to_link, &child_rel) {
+                    continue;
+                }
+
+                let child_target = target.join(name);
+                let (is_dir, dangling) = classify(&entry, &child_target)?;
+                let contrib = Contribution {
+                    target: child_target,
+                    priority,
+                    is_dir,
+                    dangling,
+                    ignore_collisions,
+                };
+                by_name.entry(name.to_string()).or_default().push(contrib);
             }
         }
-        return Ok((Resolution::Symlink(winner.target.clone()), None));
-    }
 
-    // After the winner is a directory, only directory contributors merge;
-    // lower-priority files are shadowed and dropped.
-    let dirs = contribs.iter().filter(|c| c.is_dir);
+        for (name, mut contribs) in by_name {
+            let child_out = out_dir.join(&name);
 
-    // exactly one directory: link it whole, don't descend (laziness).
-    if dirs.clone().count() == 1 {
-        return Ok((Resolution::Symlink(winner.target.clone()), None));
-    }
+            // Lowest priority number wins; stable so ties keep discovery order.
+            contribs.sort_by_key(|c| c.priority);
+            let winner = &contribs[0];
 
-    // multiple directories must merge: real dir, descend into each.
-    let to_descend = dirs
-        .map(|c| (c.target.clone(), c.priority, c.ignore_collisions))
-        .collect();
-    Ok((Resolution::Directory, Some(to_descend)))
-}
-
-// The frontier loop: alternate shallow reads with a
-// sequential, deterministic fold that owns the resolution map.
-fn build_symlinks(
-    roots: Vec<Root>,
-    paths_to_link: &[String],
-    check_contents: bool,
-) -> anyhow::Result<BTreeMap<String, Resolution>> {
-    let mut resolutions = BTreeMap::new();
-
-    for p in paths_to_link {
-        for ancestor in Path::new(p).ancestors() {
-            let key = ancestor.to_str().unwrap().to_string();
-            resolutions.entry(key).or_insert(Resolution::Directory);
-        }
-    }
-
-    let mut frontier = vec![FrontierItem {
-        rel_name: String::new(),
-        dirs: roots,
-    }];
-
-    while !frontier.is_empty() {
-        let levels: Vec<Vec<(String, Contribution)>> = frontier
-            .iter()
-            .flat_map(|item| {
-                item.dirs
-                    .iter()
-                    .map(move |(target, prio, ic)| read_level(&item.rel_name, target, *prio, *ic))
-            })
-            .collect::<anyhow::Result<_>>()?;
-
-        let mut by_rel: BTreeMap<String, Vec<Contribution>> = BTreeMap::new();
-        for (rel, c) in levels.into_iter().flatten() {
-            if skip(paths_to_link, &rel) {
+            // A file winner shadows everything: one symlink.
+            if !winner.is_dir {
+                for rival in contribs.iter().skip(1) {
+                    if rival.priority == winner.priority && rival.target != winner.target {
+                        handle_collision(winner, rival, self.check_collision_contents)?;
+                    }
+                }
+                self.link_leaf(&child_out, &winner.target, winner.dangling)?;
                 continue;
             }
-            by_rel.entry(rel).or_default().push(c);
-        }
 
-        frontier.clear();
-        for (rel, contribs) in by_rel {
-            let (resolution, descend) = resolve(contribs, check_contents)?;
-            if let Some(dirs) = descend {
-                frontier.push(FrontierItem {
-                    rel_name: rel.clone(),
-                    dirs,
-                });
+            // Directory winner: only directory contributors merge.
+            let dir_contribs: Vec<Root> = contribs
+                .iter()
+                .filter(|c| c.is_dir)
+                .map(|c| (c.target.clone(), c.priority, c.ignore_collisions))
+                .collect();
+
+            let child_rel = [rel_name, &name].join("/");
+
+            // A lone, unforced directory links whole; forced dirs and multi-dir
+            // nodes become real directories we descend into.
+            if dir_contribs.len() == 1 && !self.forced.contains(&child_rel) {
+                self.link_leaf(&child_out, &winner.target, false)?;
+                continue;
             }
-            resolutions.insert(rel, resolution);
+            if !self.forced.contains(&child_rel) {
+                fs::create_dir(&child_out)?;
+            }
+            self.merge(&child_rel, &child_out, &dir_contribs)?;
         }
-    }
 
-    Ok(resolutions)
+        Ok(())
+    }
 }
 
-// Append a package root if not already seen; queue its propagated packages.
-fn discover_root(
-    d: &mut Discovery,
-    pkg_dir: &str,
-    priority: i32,
-    policy: IgnoreCollisions,
-    store_dir: &Path,
+#[derive(Default)]
+struct Discovery {
+    roots: Vec<Root>,
+    done: BTreeSet<String>,
+    postponed: BTreeSet<String>,
+    store_dir: PathBuf,
     ignore_single_file_outputs: bool,
-) -> anyhow::Result<()> {
+}
 
-    if !d.done.insert(pkg_dir.to_string()) {
-        return Ok(());
-    }
-
-    let pkg_dir = Path::new(pkg_dir);
-    // A store path that is a plain file can't be merged.
-    if pkg_dir.is_file() && pkg_dir.starts_with(store_dir) {
-        if ignore_single_file_outputs {
-            eprintln!("The store path {pkg_dir:?} is a file and can't be merged, ignoring it");
-            return Ok(());
+impl Discovery {
+    // Append a package root if unseen; queue its propagated packages.
+    fn add_root(&mut self, pkg_dir: &str, priority: i32, policy: IgnoreCollisions) {
+        if !self.done.insert(pkg_dir.to_string()) {
+            return;
         }
-        anyhow::bail!("The store path {pkg_dir:?} is a file and can't be merged!");
-    }
 
-    d.roots.push((pkg_dir.to_path_buf(), priority, policy));
+        let pkg_path = Path::new(pkg_dir);
+        if pkg_path.is_file() && pkg_path.starts_with(&self.store_dir) {
+            if self.ignore_single_file_outputs {
+                eprintln!("The store path {pkg_path:?} is a file and can't be merged, ignoring it");
+                return;
+            }
+            panic!("The store path {pkg_path:?} is a file and can't be merged!");
+        }
 
-    let propagated = pkg_dir.join("nix-support/propagated-user-env-packages");
-    if let Ok(content) = fs::read_to_string(&propagated) {
-        for p in content.split_whitespace() {
-            if !d.done.contains(p) {
-                d.postponed.insert(p.to_string());
+        self.roots.push((pkg_path.to_path_buf(), priority, policy));
+
+        let propagated = pkg_path.join("nix-support/propagated-user-env-packages");
+        if let Ok(content) = read_to_string(&propagated) {
+            for p in content.split_whitespace() {
+                if !self.done.contains(p) {
+                    self.postponed.insert(p.to_string());
+                }
             }
         }
     }
-    Ok(())
 }
 
 pub fn run() -> anyhow::Result<()> {
-    let config_path = std::env::var("NIX_ATTRS_JSON_FILE")?;
-    // let config_path = args_iter.next().context("supply JSON config as arg")?;
-    let config = fs::read_to_string(config_path).context("cannot read structured attrs JSON file")?;
+    let config_path = env::var("NIX_ATTRS_JSON_FILE")
+        .context("missing required environment variable NIX_ATTRS_JSON_FILE")?;
+    let config = read_to_string(config_path).context("cannot read structured attrs JSON file")?;
     let args: Args = Args::deserialize_json(&config).context("config is invalid")?;
 
-    // TODO get caller supplied
-    let store_dir =
-        PathBuf::from(std::env::var("NIX_STORE").unwrap_or_else(|_| "/nix/store".to_string()));
+    let store_dir = PathBuf::from(env::var("NIX_STORE").unwrap_or("/nix/store".into()));
 
-    let mut d = Discovery::default();
-    let ignore_collisions = if args.ignore_collisions {
-        IgnoreCollisions::True
-    } else {
-        IgnoreCollisions::False
+    let mut discovery = Discovery {
+        store_dir,
+        ignore_single_file_outputs: args.ignore_single_file_outputs,
+        ..Default::default()
     };
 
-    // explicitly chosen packages, under the user's collision policy.
+    let ignore_collisions = match args.ignore_collisions {
+        true => IgnoreCollisions::True,
+        false => IgnoreCollisions::False,
+    };
+
     for pkg in &args.chosen_outputs {
         for path in &pkg.paths {
             if Path::new(path).try_exists()? {
-                discover_root(
-                    &mut d,
-                    path,
-                    pkg.priority,
-                    ignore_collisions,
-                    &store_dir,
-                    args.ignore_single_file_outputs,
-                )?;
+                discovery.add_root(path, pkg.priority, ignore_collisions);
             }
         }
     }
 
-    // propagated packages, lower priority, collisions always silent
-    // priority is assigned by sorted order so it's deterministic regardless
-    // of discovery order.
     let mut priority = 1000;
-    while !d.postponed.is_empty() {
-        let batch: Vec<String> = std::mem::take(&mut d.postponed).into_iter().collect();
-        // BTreeSet iterates sorted, collect preserves that order.
-        for pkg in batch {
-            discover_root(
-                &mut d,
-                &pkg,
-                priority,
-                IgnoreCollisions::TrueDontWarn,
-                &store_dir,
-                args.ignore_single_file_outputs,
-            )?;
+    while !discovery.postponed.is_empty() {
+        for pkg in std::mem::take(&mut discovery.postponed) {
+            discovery.add_root(&pkg, priority, IgnoreCollisions::TrueDontWarn);
             priority += 1;
         }
     }
 
-    // extra paths from a file (directories only), priority 1000.
     if !args.extra_paths_from.is_empty() {
-        let content = fs::read_to_string(&args.extra_paths_from)
+        let content = read_to_string(&args.extra_paths_from)
             .with_context(|| format!("cannot open extra paths file {:?}", args.extra_paths_from))?;
         for pkg in content.lines() {
             if Path::new(pkg).is_dir() {
-                discover_root(
-                    &mut d,
-                    pkg,
-                    1000,
-                    ignore_collisions,
-                    &store_dir,
-                    args.ignore_single_file_outputs,
-                )?;
+                discovery.add_root(pkg, 1000, ignore_collisions);
             }
         }
     }
 
-    // walk all roots and resolve into the final symlink map.
-    let resolutions = build_symlinks(d.roots, &args.paths_to_link, args.check_collision_contents)?;
-
-    // realize, btreemap order guarantees parents precede children.
-
+    // Pre-create the pathsToLink entry chains (this also creates the output base
+    // and every forced ancestor directory), then fuse-walk.
     let base = Path::new(&args.outputs.out).join(&args.extra_prefix);
-    let abs = |rel: &str| base.join(rel.strip_prefix('/').unwrap_or(rel));
-
-    fs::create_dir_all(base.parent().unwrap())?;
-
-    let mut nr_links = 0;
-    for (rel, res) in &resolutions {
-        match res {
-            Resolution::Directory => fs::create_dir(abs(rel))?,
-            Resolution::Symlink(target) =>  {
-                symlink(target, abs(rel))?;
-                nr_links += 1;
-            }
-        }
+    fs::create_dir_all(&base)?;
+    for p in &args.paths_to_link {
+        fs::create_dir_all(base.join(p.strip_prefix('/').unwrap_or(p)))?;
     }
 
-    eprintln!("created {nr_links} symlinks in user environment");
+    let mut merge_context = MergeContext {
+        nr_links: 0,
+        forced: forced_dirs(&args.paths_to_link),
+        paths_to_link: args.paths_to_link,
+        check_collision_contents: args.check_collision_contents,
+    };
+
+    merge_context.merge("", &base, &discovery.roots)?;
+
+    eprintln!(
+        "created {} symlinks in user environment",
+        merge_context.nr_links
+    );
 
     if !args.manifest.is_empty() {
-        symlink(&args.manifest, Path::new(&args.outputs.out).join("manifest"))
-            .context("cannot create manifest")?;
+        let manifest = Path::new(&args.outputs.out).join("manifest");
+        symlink(&args.manifest, manifest).context("cannot create manifest")?;
     }
 
     Ok(())

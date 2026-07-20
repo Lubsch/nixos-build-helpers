@@ -69,7 +69,7 @@ runCommand "smoke-tests"
   {
     nativeBuildInputs = [ diffutils ];
     passthru = {
-      inherit etc-units overlay;
+      inherit etc-units overlay system-path;
     };
   }
   ''

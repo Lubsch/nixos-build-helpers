@@ -8,8 +8,7 @@ mod generate_units;
 const COMMANDS: &str = "Commands: build-composefs-dump, build-etc, generate-units, build-env";
 
 fn main() -> Result<()> {
-    let mut args = std::env::args();
-    let command = args
+    let command = std::env::args()
         .nth(1)
         .with_context(|| anyhow!("Missing command argument\n{COMMANDS}"))?;
 

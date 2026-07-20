@@ -19,7 +19,7 @@ const INLINE_CONTENT_MAX: u64 = 4096;
 #[derive(DeJson)]
 struct Config {
     #[nserde(rename = "etc'")]
-    etc: Vec<Attrs>
+    etc: Vec<Attrs>,
 }
 
 #[derive(DeJson)]
@@ -219,7 +219,11 @@ pub fn run() -> anyhow::Result<()> {
             for glob_source in glob_sources {
                 let glob_source = glob_source?;
                 let basename = glob_source.file_name().unwrap();
-                let glob_target = Path::new(target).join(basename).to_str().unwrap().to_string();
+                let glob_target = Path::new(target)
+                    .join(basename)
+                    .to_str()
+                    .unwrap()
+                    .to_string();
 
                 let composefs_path = ComposefsPath::new(
                     attrs,

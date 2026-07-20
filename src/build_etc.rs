@@ -13,7 +13,7 @@ use std::{
 #[derive(Debug, DeJson)]
 struct Config {
     #[nserde(rename = "etc'")]
-    etc: Vec<Entry>
+    etc: Vec<Entry>,
 }
 
 #[derive(Debug, DeJson)]
@@ -54,9 +54,18 @@ fn make_etc_entry(entry: Entry, etc: &Path) -> anyhow::Result<()> {
 
         // NOTE differs from original that it fails here when there are duplicates
         if entry.mode != "symlink" {
-            write(target.with_added_extension("mode"), format!("{}\n", entry.mode))?;
-            write(target.with_added_extension("uid"), format!("{}\n", entry.user))?;
-            write(target.with_added_extension("gid"), format!("{}\n", entry.group))?;
+            write(
+                target.with_added_extension("mode"),
+                format!("{}\n", entry.mode),
+            )?;
+            write(
+                target.with_added_extension("uid"),
+                format!("{}\n", entry.user),
+            )?;
+            write(
+                target.with_added_extension("gid"),
+                format!("{}\n", entry.group),
+            )?;
         }
     }
     Ok(())
