@@ -73,14 +73,15 @@ runCommand "smoke-tests"
     };
   }
   ''
+    set -e
     touch $out # otherwise build always fails
 
     echo "compares /etc and system-units (which are also placed inside /etc)"
     diff -r ${etc-units.reference.config.system.build.etc} ${etc-units.test.config.system.build.etc}
 
     echo "compares content of metadataImage"
-    diff ${overlay.reference.config.system.build.etcMetadataImage} ${overlay.test.config.system.build.etcMetadataImage}
+    diff -r ${overlay.reference.config.system.build.etcMetadataImage} ${overlay.test.config.system.build.etcMetadataImage}
 
     echo "compares content of system path (/run/current-system/sw)"
-    diff ${etc-units.reference.config.system.path} ${system-path.test.config.system.path}
+    diff -r ${etc-units.reference.config.system.path} ${system-path.test.config.system.path}
   ''
