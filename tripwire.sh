@@ -74,6 +74,13 @@ scan() {
   return $found
 }
 
+echo "modulesPath: $MODULES"
+echo "system.path allow list:"
+echo "${allow_system_path[@]}"
+echo
+echo "system.build.etc allow list:"
+echo "${allow_system_build_etc[@]}"
+
 rc=0
 
 scan "system.path" \

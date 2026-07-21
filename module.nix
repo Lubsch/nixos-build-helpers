@@ -23,7 +23,7 @@ in
       # avoid garbage collection which would make offline rebuilds impossible
       nixos-build-helpers
       # tripwire test to detect references to system.path or system.build.etc
-      (pkgs.runCommand "tripwire-check" {} ''${./tripwire.sh} ${pkgs.path} && touch $out'')
+      (pkgs.runCommand "tripwire-check" {} ''${./tripwire.sh} ${pkgs.path} |& tee $out'')
     ];
 
     # Dbus usually depends on system.path
