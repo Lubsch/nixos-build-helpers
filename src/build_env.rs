@@ -261,7 +261,7 @@ fn skip(child_rel: &str, paths_to_link: &[String]) -> bool {
             // Is `path` at or above some pathsToLink entry? (must descend through it)
             child_rel.is_empty()
                 || paths_to_link.iter().any(|p| {
-                    p == child_rel || (p.starts_with(&child_rel) && p.as_bytes().get(child_rel.len()) == Some(&b'/'))
+                    p == child_rel || (p.starts_with(child_rel) && p.as_bytes().get(child_rel.len()) == Some(&b'/'))
                 })
             // Is `path` at or below some pathsToLink entry? (its subtree is wanted)
             // `p == "/"` matches everything, mirroring the Perl special case.

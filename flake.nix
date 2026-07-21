@@ -23,17 +23,17 @@
         }
       );
 
-    packages = mapSystems (
-      _: pkgs: {
-        default = pkgs.callPackage ./package.nix {};
-      }
-    );
+      packages = mapSystems (
+        _: pkgs: {
+          default = pkgs.callPackage ./package.nix { };
+        }
+      );
 
-    checks = mapSystems (
-      _: pkgs: {
-        default = pkgs.callPackage ./tests.nix { inherit nixpkgs; };
-      }
-    );
+      checks = mapSystems (
+        _: pkgs: {
+          default = pkgs.callPackage ./tests.nix { inherit nixpkgs; };
+        }
+      );
 
-  };
+    };
 }

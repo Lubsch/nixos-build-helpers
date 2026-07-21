@@ -55,12 +55,13 @@ in
 
             ${config.environment.extraSetup}
           '';
-        }).overrideDerivation (_: {
-          buildCommand = ''
-            ${lib.getExe nixos-build-helpers} build-env
-            eval "$postBuild"
-          '';
-        })
+        }).overrideDerivation
+          (_: {
+            buildCommand = ''
+              ${lib.getExe nixos-build-helpers} build-env
+              eval "$postBuild"
+            '';
+          })
       )
     );
 
@@ -89,19 +90,20 @@ in
         );
         etc = lib.mkIf (cfg.etc || cfg.etcOverlay) (
           lib.mkForce (
-            if cfg.etc then
-              pkgs.runCommandLocal "etc" {
-                __structuredAttrs = true;
-                inherit etc';
-                # This is needed for the systemd module
-                passthru.targets = map (x: x.target) etc';
-              } "${lib.getExe nixos-build-helpers} build-etc"
-            else
-              {
-                outPath = "/";
-                passthru.targets = map (x: x.target) etc';
-              }
+            (
+              if cfg.etc then
+                pkgs.runCommandLocal "etc" {
+                  __structuredAttrs = true;
+                  inherit etc';
+                } "${lib.getExe nixos-build-helpers} build-etc"
+              else
+                { outPath = "/"; }
             )
+            // {
+              # This is needed for the systemd module
+              passthru.targets = map (x: x.target) etc';
+            }
+          )
         );
       };
 
