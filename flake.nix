@@ -7,7 +7,6 @@
     {
       nixosModules = {
         default = ./module.nix;
-        fix-dependencies = ./dependencies.nix;
       };
 
       devShells = mapSystems (

@@ -19,8 +19,12 @@ in
   };
 
   config = {
-    # avoid garbage collection which would make offline rebuilds impossible
-    system.extraDependencies = [ nixos-build-helpers ];
+    system.extraDependencies = [
+      # avoid garbage collection which would make offline rebuilds impossible
+      nixos-build-helpers
+      # tripwire test to detect references to system.path or system.build.etc
+      (pkgs.runCommand "tripwire-check" {} ''${./tripwire.sh} ${pkgs.path} && touch $out'')
+    ];
 
     # Dbus usually depends on system.path
     # Use this hack instead
