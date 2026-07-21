@@ -11,18 +11,19 @@ let
 in
 {
   options.nixosBuildHelpers = {
-    etc = lib.mkEnableOption "NixOS build helper for etc overlayfs";
-    etcOverlay = lib.mkEnableOption "NixOS build helper for etc";
-    systemdUnits = lib.mkEnableOption "NixOS build helper for systemd units";
-    buildEnv = lib.mkEnableOption "Nixos build helper to build system path quicker";
+    etc = lib.mkEnableOption "Faster builder for etc";
+    etcOverlay = lib.mkEnableOption "Faster builder for etc when using overlayfs";
+    systemdUnits = lib.mkEnableOption "Faster builder for systemd units (e.g. symstem-units, user-units, ...)";
+    buildEnv = lib.mkEnableOption "Faster builder for system-path";
     fixDependencies = lib.mkEnableOption "Make etc not depend on system-path";
   };
 
   config = {
-
     # avoid garbage collection which would make offline rebuilds impossible
     system.extraDependencies = [ nixos-build-helpers ];
 
+    # Dbus usually depends on system.path
+    # Use this hack instead
     services.dbus.packages = lib.mkIf (cfg.fixDependencies) (
       lib.mkForce [
         config.services.dbus.dbusPackage
@@ -30,6 +31,8 @@ in
       ]
     );
 
+    # Don't depend on terminfo in system.path
+    # Just rely on terminfo which has many terminals' terminfo
     environment.etc.terminfo = lib.mkIf (cfg.fixDependencies) (
       lib.mkForce {
         source = "${pkgs.ncurses}/share/terminfo";
@@ -55,6 +58,7 @@ in
 
             ${config.environment.extraSetup}
           '';
+          # This override is all we've changed...
         }).overrideDerivation
           (_: {
             buildCommand = ''
@@ -88,6 +92,8 @@ in
               ''
           )
         );
+
+        # Change how system.build.etc is built or avoid building it at all
         etc = lib.mkIf (cfg.etc || cfg.etcOverlay) (
           lib.mkForce (
             (
@@ -97,6 +103,10 @@ in
                   inherit etc';
                 } "${lib.getExe nixos-build-helpers} build-etc"
               else
+                # Only here to be linked in by toplevel
+                # Usually the etc derivation contains a subdir called etc
+                # This hack links it to your run-time / which containts /etc
+                # which is your run-time overlayfs
                 { outPath = "/"; }
             )
             // {
@@ -107,6 +117,7 @@ in
         );
       };
 
+    # Very hacky override. It might be better to "just" patch nixpkgs
     _module.args.utils =
       let
         utilsBase = import "${modulesPath}/../lib/utils.nix" { inherit lib config pkgs; };
@@ -150,6 +161,13 @@ in
           }
         )
       );
+
+    assertions = [
+      {
+        assertion = !(cfg.etc && cfg.etcOverlay);
+        message = "etcOverlay disables building etc completely";
+      }
+    ];
 
   };
 }
