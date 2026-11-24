@@ -1,24 +1,21 @@
+//! Replacement for `generateUnits` in nixos/lib/systemd-lib.nix (system-, user-, initrd-, nspawn-units).
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::fs::{self, create_dir_all, read_link, remove_file};
 use std::io::ErrorKind::AlreadyExists;
 use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, Result, bail};
 use nanoserde::DeJson;
 
-#[derive(DeJson, Debug)]
-struct Config {
-    #[nserde(rename = "generate-units-args")]
-    generate_units_args: Args,
-}
+use crate::{file_name, glob_dir};
 
 #[derive(DeJson, Debug)]
 struct Unit {
     unit: String,
     #[nserde(rename = "overrideStrategy")]
-    override_strategy: Option<String>,
+    override_strategy: String,
     aliases: Vec<String>,
     #[nserde(rename = "wantedBy")]
     wanted_by: Vec<String>,
@@ -29,7 +26,7 @@ struct Unit {
 }
 
 #[derive(DeJson, Debug)]
-struct Args {
+pub struct Args {
     #[nserde(rename = "allowCollisions")]
     allow_collisions: bool,
     #[nserde(rename = "type")]
@@ -39,6 +36,7 @@ struct Args {
     upstream_units: Vec<String>,
     #[nserde(rename = "upstreamWants")]
     upstream_wants: Vec<String>,
+    /// A set, like upstream's associative array.
     packages: BTreeSet<String>,
     package: String,
     #[nserde(rename = "defaultUnit")]
@@ -47,20 +45,152 @@ struct Args {
     ctrl_alt_del_unit: String,
 }
 
-fn copy_no_deref(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let meta = fs::symlink_metadata(src)?;
-    if meta.file_type().is_symlink() {
-        let target = fs::read_link(src)?;
-        symlink(target, dst)?;
-    } else {
-        fs::copy(src, dst)?;
+pub fn run(args: Args, out: &Path) -> Result<()> {
+    let type_dir = match args.units_type.as_str() {
+        "system" | "initrd" => "system",
+        "user" => "user",
+        "nspawn" => "nspawn",
+        t => bail!("type must be one of system | initrd | user | nspawn, got {t:?}"),
+    };
+    create_dir_all(out)?;
+    let upstream = Path::new(&args.package)
+        .join("example/systemd")
+        .join(type_dir);
+
+    // Copy the upstream systemd units we're interested in.
+    for unit in &args.upstream_units {
+        let p = upstream.join(unit);
+        let out_p = out.join(file_name(&p)?);
+        let meta = p
+            .symlink_metadata()
+            .with_context(|| format!("missing {p:?}"))?;
+        if !p.exists() {
+            bail!("missing {p:?}");
+        }
+        if meta.is_symlink() && !read_link(&p)?.starts_with("..") {
+            copy_no_deref(&p, &out_p)?;
+        } else if meta.is_symlink() {
+            symlink(p.canonicalize()?, out_p)?; // ln -s "$(readlink -f "$fn")"
+        } else {
+            symlink(&p, out_p)?;
+        }
     }
+
+    // Copy .wants links, but only those that point to units that we're interested in.
+    for wants in &args.upstream_wants {
+        let p = upstream.join(wants);
+        if !p.exists() {
+            bail!("missing {p:?}");
+        }
+        let out_dir = out.join(file_name(&p)?);
+        fs::create_dir(&out_dir)?;
+        for link in glob_dir(&p)? {
+            let out_link = out_dir.join(file_name(&link)?);
+            copy_no_deref(&link, &out_link)?;
+            if !out_link.exists() {
+                remove_file(&out_link)?; // dangling
+            }
+        }
+    }
+
+    // Symlink all units provided listed in systemd.packages.
+    for pkg in &args.packages {
+        let mut entries = glob_dir(&Path::new(pkg).join("etc/systemd").join(type_dir))?;
+        entries.extend(glob_dir(
+            &Path::new(pkg).join("lib/systemd").join(type_dir),
+        )?);
+        for p in entries {
+            let name = file_name(&p)?;
+            // upstream: [[ "$fn" =~ .wants$ ]]
+            if p.as_os_str().as_encoded_bytes().ends_with(b"wants") {
+                continue;
+            }
+            if p.is_dir() {
+                lndir(&p, &out.join(name))?;
+            } else {
+                symlink(&p, out.join(name))?;
+            }
+        }
+    }
+
+    // Symlink units defined by systemd.units. With asDropinIfExists, units that are also provided
+    // by systemd or systemd.packages become <unit>.d/overrides.conf, extending the upstream unit.
+    for u in args.units.values() {
+        // A unit derivation contains exactly one file, the unit.
+        let dir = Path::new(&u.unit);
+        let src = fs::read_dir(dir)?
+            .next()
+            .context("empty unit derivation")??
+            .path();
+        let name = file_name(&src)?;
+        let out_p = out.join(name);
+        let as_dropin = || -> Result<()> {
+            let dropin_dir = out_p.with_added_extension("d");
+            create_dir_all(&dropin_dir)?;
+            symlink(&src, dropin_dir.join("overrides.conf"))?;
+            Ok(())
+        };
+        match u.override_strategy.as_str() {
+            "asDropinIfExists" if !out_p.exists() => symlink_force(&src, &out_p)?,
+            "asDropinIfExists" if src.canonicalize()? == Path::new("/dev/null") => {
+                symlink_force(Path::new("/dev/null"), &out_p)?
+            }
+            "asDropinIfExists" if args.allow_collisions => as_dropin()?,
+            "asDropinIfExists" => bail!("Found multiple derivations configuring {name:?}!"),
+            "asDropin" => as_dropin()?,
+            s => bail!("unknown overrideStrategy {s:?}"),
+        }
+    }
+
+    // Create service aliases from aliases option.
+    for (name, u) in &args.units {
+        for alias in &u.aliases {
+            symlink_force(Path::new(name), &out.join(alias))?;
+        }
+    }
+
+    // Create .wants, .upholds and .requires symlinks from wantedBy, upheldBy and requiredBy.
+    for (name, u) in &args.units {
+        let deps = [
+            (&u.wanted_by, "wants"),
+            (&u.upheld_by, "upholds"),
+            (&u.required_by, "requires"),
+        ];
+        for (targets, suffix) in deps {
+            for target in targets {
+                let dir = out.join(target).with_added_extension(suffix);
+                create_dir_all(&dir)?;
+                symlink_force(Path::new(&format!("../{name}")), &dir.join(name))?;
+            }
+        }
+    }
+
+    if args.units_type == "system" {
+        // Stupid misc. symlinks.
+        symlink(&args.default_unit, out.join("default.target"))?;
+        symlink(&args.ctrl_alt_del_unit, out.join("ctrl-alt-del.target"))?;
+        symlink(
+            "../remote-fs.target",
+            out.join("multi-user.target.wants/remote-fs.target"),
+        )?;
+    }
+
     Ok(())
 }
 
-fn lnf(original: &Path, link: &Path) -> std::io::Result<()> {
+/// `cp -pd`
+fn copy_no_deref(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.symlink_metadata()?.is_symlink() {
+        symlink(read_link(src)?, dst)
+    } else {
+        fs::copy(src, dst).map(|_| ())
+    }
+}
+
+/// `ln -sfn`
+fn symlink_force(original: &Path, link: &Path) -> std::io::Result<()> {
     match symlink(original, link) {
-        Err(ref e) if e.kind() == AlreadyExists => {
+        Err(e) if e.kind() == AlreadyExists => {
             remove_file(link)?;
             symlink(original, link)
         }
@@ -68,181 +198,25 @@ fn lnf(original: &Path, link: &Path) -> std::io::Result<()> {
     }
 }
 
+/// `mkdir -p dst && lndir src dst`: mirror the tree, linking files to `src`, but copying symlinks
+/// as they are (including symlinked directories). Existing entries are kept.
 fn lndir(src: &Path, dst: &Path) -> std::io::Result<()> {
     create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        // file_type() doesn't follow symlinks, matching lndir treating
-        // symlinked dirs as links, not recursion targets
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
         let ft = entry.file_type()?;
-        if ft.is_dir() {
-            lndir(&from, &to)?;
+        let res = if ft.is_dir() {
+            lndir(&from, &to)
+        } else if ft.is_symlink() {
+            symlink(read_link(&from)?, &to)
         } else {
-            // leaf (file or symlink) -> symlink pointing at source
-            match symlink(&from, &to) {
-                Err(ref e) if e.kind() == AlreadyExists => {} // lndir skips existing, warns
-                x => x?,
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn run() -> anyhow::Result<()> {
-    let config_path = std::env::var("NIX_ATTRS_JSON_FILE").context("No json config in env")?;
-    let config_str = fs::read_to_string(config_path).context("Config isn't accessible")?;
-    let config = Config::deserialize_json(&config_str).context("Config is invalid")?;
-    let args = config.generate_units_args;
-
-    let type_dir = match args.units_type.as_str() {
-        "system" => "system",
-        "initrd" => "system",
-        "user" => "user",
-        "nspawn" => "nspawn",
-        _ => bail!("type must be one of system | initrd | user | nspawn"),
-    };
-
-    let out: PathBuf = std::env::var("out").unwrap().into();
-    // let tmpdir = tempfile::tempdir()?;
-    // let out: PathBuf = tmpdir.keep();
-    // dbg!(&out);
-    fs::create_dir_all(&out)?;
-
-    for unit in args.upstream_units {
-        let p = Path::new(&args.package)
-            .join("example/systemd")
-            .join(type_dir)
-            .join(unit);
-        let Ok(meta) = p.symlink_metadata() else {
-            bail!("missing {p:?}");
+            symlink(&from, &to)
         };
-        if meta.is_symlink() {
-            let target = read_link(&p)?;
-            if target.iter().next() == Some(OsStr::new("..")) {
-                symlink(&p, out.join(p.file_name().unwrap()))?;
-            } else {
-                copy_no_deref(&p, &out.join(p.file_name().unwrap()))?
-            }
-        } else {
-            symlink(&p, out.join(p.file_name().unwrap()))?;
+        match res {
+            Err(e) if e.kind() == AlreadyExists => {}
+            x => x?,
         }
     }
-
-    for unit in args.upstream_wants {
-        let p = Path::new(&args.package)
-            .join("example/systemd")
-            .join(type_dir)
-            .join(unit);
-        if !p.exists() {
-            bail!("missing {p:?}");
-        };
-        let x = &out.join(p.file_name().unwrap());
-        fs::create_dir(x)?;
-        for i in glob::glob(p.join("*").to_str().unwrap()).unwrap() {
-            let i = &i.unwrap();
-            let y = x.join(i.file_name().unwrap());
-            copy_no_deref(i, &y)?;
-            // dangling symlink case
-            if !y.exists() {
-                remove_file(&y)?;
-            }
-        }
-    }
-
-    for pkg in args.packages {
-        for p in glob::glob(&format!("{pkg}/etc/systemd/{type_dir}/*"))?
-            .chain(glob::glob(&format!("{pkg}/lib/systemd/{type_dir}/*"))?)
-        {
-            let p = p?;
-            if p.extension() == Some(OsStr::new("wants")) {
-                continue;
-            }
-            let file_name = p.file_name().unwrap();
-            if p.is_dir() {
-                let target_dir = out.join(file_name);
-                create_dir_all(target_dir)?;
-
-                lndir(&p, &out.join(file_name))?;
-            } else {
-                symlink(&p, out.join(file_name))?;
-            }
-        }
-    }
-
-    for u in args.units.values() {
-        // There's guaranteed to be a unit file in there
-        let unit = Path::new(&u.unit);
-        let p = unit.read_dir()?.next().unwrap()?.path();
-        let p = p.file_name().unwrap();
-        let p_out = out.join(p);
-        let p_out_d = p_out.with_added_extension("d");
-
-        match u.override_strategy.as_deref() {
-            Some("asDropinIfExists") | None if !p_out.exists() => {
-                symlink(unit.join(p), p_out)?;
-            }
-            Some("asDropinIfExists") | None => {
-                if unit.join(p).canonicalize()? == Path::new("/dev/null") {
-                    remove_file(&p_out)?;
-                    symlink(Path::new("/dev/null"), p_out)?;
-                } else {
-                    if args.allow_collisions {
-                        create_dir_all(&p_out_d)?;
-                        symlink(unit.join(p), p_out_d.join("overrides.conf"))?;
-                    } else {
-                        bail!("Found multiple derivations configuring {:?}", u.unit);
-                    }
-                }
-            }
-            Some("asDropin") => {
-                create_dir_all(&p_out_d)?;
-                symlink(unit.join(p), p_out_d.join("overrides.conf"))?;
-            }
-            Some(x) => bail!("Unknown overrideStrategy {x}"),
-        }
-    }
-
-    for (name, u) in &args.units {
-        for name2 in &u.aliases {
-            lnf(Path::new(&name), &out.join(name2))?;
-        }
-    }
-
-    for (name, u) in &args.units {
-        for name2 in &u.wanted_by {
-            let wants = out.join(name2).with_added_extension("wants");
-            create_dir_all(&wants)?;
-            lnf(Path::new(&format!("../{name}")), &wants.join(name))?;
-        }
-    }
-
-    for (name, u) in &args.units {
-        for name2 in &u.upheld_by {
-            let upholds = out.join(name2).with_added_extension("upholds");
-            create_dir_all(&upholds)?;
-            lnf(Path::new(&format!("../{name}")), &upholds.join(name))?;
-        }
-    }
-
-    for (name, u) in &args.units {
-        for name2 in &u.required_by {
-            let requires = out.join(name2).with_added_extension("requires");
-            create_dir_all(&requires)?;
-            lnf(Path::new(&format!("../{name}")), &requires.join(name))?;
-        }
-    }
-
-    if args.units_type == "system" {
-        symlink(args.default_unit, out.join("default.target"))?;
-        symlink(args.ctrl_alt_del_unit, out.join("ctrl-alt-del.target"))?;
-
-        symlink(
-            "../remote-fs.target",
-            out.join("multi-user.target.wants/remote-fs.target"),
-        )?;
-    }
-
     Ok(())
 }

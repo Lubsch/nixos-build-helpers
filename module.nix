@@ -3,175 +3,212 @@
   lib,
   pkgs,
   modulesPath,
+  extendModules,
   ...
 }:
 let
+  inherit (lib) mkIf mkForce mkEnableOption;
   cfg = config.nixosBuildHelpers;
-  nixos-build-helpers = pkgs.callPackage ./package.nix { };
+  nixos-build-helpers = pkgs.buildPackages.callPackage ./package.nix { };
+  exe = lib.getExe nixos-build-helpers;
+
+  # This system without any of our overrides. It shares `pkgs`, so evaluating values from it is
+  # cheap. Wrapping upstream's values instead of copying their definitions keeps us in sync with
+  # nixpkgs, e.g. system.path's postBuild or modules adding to services.dbus.packages.
+  upstream =
+    (extendModules {
+      modules = [
+        # Stronger than mkForce, so that this also works on variants that mkForce our options.
+        (lib.mkOverride 1 {
+          nixosBuildHelpers = lib.mapAttrs (_: _: false) cfg;
+          nixpkgs.pkgs = pkgs;
+        })
+      ];
+    }).config;
+
+  # Comparing derivations (==) would evaluate upstream's system.path just for that (~0.2 s).
+  isSystemPath = p: lib.isDerivation p && p.name == upstream.system.path.name;
+
+  # Only the attributes our builders read. Passing whole entries would put e.g. every `text` into
+  # the derivation a second time.
+  etcEntries = map (f: {
+    source = "${f.source}"; # like upstream: forces local paths into the store
+    inherit (f)
+      target
+      mode
+      user
+      group
+      uid
+      gid
+      ;
+  }) (lib.filter (f: f.enable) (lib.attrValues config.environment.etc));
+
+  # /etc, and with etcOverlay its metadata image as a second output: they're built from the same
+  # inputs, so one derivation saves scheduling one. Not stdenv, because its setup can't handle
+  # the output name, which gives the image upstream's name: <hash>-etc-metadata.erofs.
+  etc =
+    if cfg.etcOverlay then
+      derivation {
+        name = "etc";
+        inherit (pkgs.stdenv.buildPlatform) system;
+        outputs = [
+          "out"
+          "metadata.erofs"
+        ];
+        __structuredAttrs = true;
+        preferLocalBuild = true;
+        allowSubstitutes = false;
+        entries = etcEntries;
+        builder = "${pkgs.buildPackages.bash}/bin/bash";
+        args = [
+          "-euc"
+          (with pkgs.buildPackages; ''
+            source "$NIX_ATTRS_SH_FILE"
+            image=''${outputs[metadata.erofs]}
+            out=''${outputs[out]} ${exe} build-etc
+            ${exe} build-composefs-dump > etc-dump
+            ${composefs}/bin/mkcomposefs --from-file etc-dump "$image"
+            ${erofs-utils}/bin/fsck.erofs "$image"
+          '')
+        ];
+      }
+    else
+      pkgs.runCommandLocal "etc" {
+        __structuredAttrs = true;
+        entries = etcEntries;
+      } "${exe} build-etc";
+
+  upstreamUtils = import "${modulesPath}/../lib/utils.nix" { inherit lib config pkgs; };
+  upstreamGenerateUnits = upstreamUtils.systemdUtils.lib.generateUnits;
+
+  # Same signature as upstream (checked in `assertions`).
+  generateUnits =
+    {
+      allowCollisions ? true,
+      type,
+      units,
+      upstreamUnits,
+      upstreamWants,
+      packages ? config.systemd.packages,
+      package ? config.systemd.package,
+    }:
+    pkgs.runCommand "${type}-units" {
+      __structuredAttrs = true;
+      preferLocalBuild = true;
+      allowSubstitutes = false;
+      inherit
+        allowCollisions
+        type
+        upstreamUnits
+        upstreamWants
+        packages
+        package
+        ;
+      inherit (config.systemd) defaultUnit ctrlAltDelUnit;
+      units = lib.mapAttrs (_: u: {
+        unit = "${u.unit}";
+        overrideStrategy = u.overrideStrategy or "asDropinIfExists";
+        aliases = u.aliases or [ ];
+        wantedBy = u.wantedBy or [ ];
+        upheldBy = u.upheldBy or [ ];
+        requiredBy = u.requiredBy or [ ];
+      }) units;
+    } "${exe} generate-units";
+
+  # The shape of upstream's build command for buildEnv, which we replace.
+  upstreamBuildEnvCommand = builtins.unsafeDiscardStringContext "${pkgs.buildPackages.perl}/bin/perl -w ${builtins.storeDir}/[a-z0-9]{32}-builder.pl\neval \"\\$postBuild\"\n";
 in
 {
   options.nixosBuildHelpers = {
-    etc = lib.mkEnableOption "Faster builder for etc";
-    etcOverlay = lib.mkEnableOption "Faster builder for etc when using overlayfs";
-    systemdUnits = lib.mkEnableOption "Faster builder for systemd units (e.g. symstem-units, user-units, ...)";
-    buildEnv = lib.mkEnableOption "Faster builder for system-path";
-    fixDependencies = lib.mkEnableOption "Make etc not depend on system-path";
+    etc = mkEnableOption "the faster builder for `system.build.etc`";
+    etcOverlay = mkEnableOption "the faster builder for `system.build.etcMetadataImage` (used with `system.etc.overlay`). Implies `etc`";
+    systemdUnits = mkEnableOption "the faster builder for systemd units (system-units, user-units, initrd-units, nspawn-units)";
+    buildEnv = mkEnableOption "the faster builder for `system.path`";
+    fixDependencies = mkEnableOption "removing the dependency of /etc on `system.path`, so they build in parallel and /etc isn't rebuilt when only packages change";
   };
 
-  config = {
-    system.extraDependencies = [
-      # avoid garbage collection which would make offline rebuilds impossible
-      nixos-build-helpers
-      # tripwire test to detect references to system.path or system.build.etc
-      # (pkgs.runCommand "tripwire-check" {} ''${./tripwire.sh} ${pkgs.path} && touch $out'')
-    ];
+  config = lib.mkMerge [
+    (mkIf (lib.any lib.id (lib.attrValues cfg)) {
+      # Keep the builder in the store, so that offline rebuilds work after garbage collection.
+      system.extraDependencies = [ nixos-build-helpers ];
+    })
 
-    # Dbus usually depends on system.path
-    # Use this hack instead
-    services.dbus.packages = lib.mkIf (cfg.fixDependencies) (
-      lib.mkForce [
-        config.services.dbus.dbusPackage
-        { outPath = "/run/current-system/sw"; }
-      ]
-    );
-
-    # Don't depend on terminfo in system.path
-    # Just rely on terminfo which has many terminals' terminfo
-    environment.etc.terminfo = lib.mkIf (cfg.fixDependencies) (
-      lib.mkForce {
-        source = "${pkgs.ncurses}/share/terminfo";
-      }
-    );
-
-    system.path = lib.mkIf cfg.buildEnv (
-      lib.mkForce (
-        (pkgs.buildEnv {
-          name = "system-path";
-          paths = config.environment.systemPackages;
-          inherit (config.environment) pathsToLink extraOutputsToInstall;
-          ignoreCollisions = true;
-          # !!! Hacky, should modularise.
-          # outputs TODO: note that the tools will often not be linked by default
-          postBuild = ''
-            # Remove wrapped binaries, they shouldn't be accessible via PATH.
-            find $out/bin -maxdepth 1 -name ".*-wrapped" -type l -delete
-            find $out/bin -maxdepth 1 -name ".*-wrapped_*" -type l -delete
-            if [ -x $out/bin/glib-compile-schemas -a -w $out/share/glib-2.0/schemas ]; then
-                $out/bin/glib-compile-schemas $out/share/glib-2.0/schemas
-            fi
-
-            ${config.environment.extraSetup}
-          '';
-          # This override is all we've changed...
-        }).overrideDerivation
-          (_: {
-            buildCommand = ''
-              ${lib.getExe nixos-build-helpers} build-env
-              eval "$postBuild"
-            '';
-          })
-      )
-    );
-
-    system.build =
-      let
-        etc' = lib.filter (f: f.enable) (lib.attrValues config.environment.etc);
-      in
-      {
-        etcMetadataImage = lib.mkIf cfg.etcOverlay (
-          lib.mkForce (
-            pkgs.runCommandLocal "etc-metadata.erofs"
-              {
-                __structuredAttrs = true;
-                inherit etc';
-                nativeBuildInputs = with pkgs.buildPackages; [
-                  composefs
-                  erofs-utils
-                ];
-              }
-              ''
-                ${lib.getExe nixos-build-helpers} build-composefs-dump > ./etc-dump
-                mkcomposefs --from-file ./etc-dump $out
-                fsck.erofs $out
-              ''
-          )
-        );
-
-        # Change how system.build.etc is built or avoid building it at all
-        etc = lib.mkIf (cfg.etc || cfg.etcOverlay) (
-          lib.mkForce (
-            (
-              if cfg.etc then
-                pkgs.runCommandLocal "etc" {
-                  __structuredAttrs = true;
-                  inherit etc';
-                } "${lib.getExe nixos-build-helpers} build-etc"
-              else
-                # Only here to be linked in by toplevel
-                # Usually the etc derivation contains a subdir called etc
-                # This hack links it to your run-time / which containts /etc
-                # which is your run-time overlayfs
-                { outPath = "/"; }
-            )
-            // {
-              # This is needed for the systemd module
-              passthru.targets = map (x: x.target) etc';
-            }
-          )
-        );
-      };
-
-    # Very hacky override. It might be better to "just" patch nixpkgs
-    _module.args.utils =
-      let
-        utilsBase = import "${modulesPath}/../lib/utils.nix" { inherit lib config pkgs; };
-      in
-      lib.mkIf cfg.systemdUnits (
-        lib.mkForce (
-          lib.recursiveUpdate utilsBase {
-            systemdUtils.lib.generateUnits =
-              let
-                cfg = config.systemd;
-              in
-              {
-                allowCollisions ? true,
-                type,
-                units,
-                upstreamUnits,
-                upstreamWants,
-                packages ? cfg.packages,
-                package ? cfg.package,
-                defaultUnit ? cfg.defaultUnit,
-                ctrlAltDelUnit ? cfg.ctrlAltDelUnit,
-              }:
-              pkgs.runCommand "${type}-units" {
-                __structuredAttrs = true;
-                preferLocalBuild = true;
-                allowSubstitutes = false;
-                generate-units-args = {
-                  inherit
-                    allowCollisions
-                    type
-                    units
-                    upstreamUnits
-                    upstreamWants
-                    packages
-                    package
-                    defaultUnit
-                    ctrlAltDelUnit
-                    ;
-                };
-              } "${lib.getExe nixos-build-helpers} generate-units";
-          }
-        )
+    (mkIf (cfg.etc || cfg.etcOverlay) {
+      # Also needed with the overlay: switch-to-configuration compares the units in
+      # $toplevel/etc with the running ones, and the overlay's activation script compares it to
+      # /run/current-system/etc to decide whether to remount.
+      system.build.etc = mkForce (
+        etc
+        // {
+          # Needed by the systemd tmpfiles module
+          passthru.targets = map (x: x.target) etcEntries;
+        }
       );
+    })
 
-    assertions = [
-      {
-        assertion = !(cfg.etc && cfg.etcOverlay);
-        message = "etcOverlay disables building etc completely";
-      }
-    ];
+    (mkIf cfg.etcOverlay {
+      system.build.etcMetadataImage = mkForce etc."metadata.erofs";
+    })
 
-  };
+    (mkIf ((cfg.etc || cfg.etcOverlay) && !config.system.etc.overlay.enable) {
+      # Upstream's activation refers to its own etc derivation instead of system.build.etc, which
+      # would build both. Same as upstream otherwise (the tests compare the toplevels).
+      system.build.etcActivationCommands = mkForce ''
+        # Set up the statically computed bits of /etc.
+        echo "setting up /etc..."
+        ${pkgs.perl.withPackages (p: [ p.FileSlurp ])}/bin/perl ${
+          builtins.path {
+            path = modulesPath + "/system/etc/setup-etc.pl";
+            name = "setup-etc.pl";
+          }
+        } ${config.system.build.etc}/etc
+      '';
+    })
+
+    (mkIf cfg.systemdUnits {
+      _module.args.utils = mkForce (
+        lib.recursiveUpdate upstreamUtils { systemdUtils.lib = { inherit generateUnits; }; }
+      );
+    })
+
+    (mkIf cfg.buildEnv {
+      system.path = mkForce (
+        upstream.system.path.overrideAttrs {
+          buildCommand = ''
+            ${exe} build-env
+            eval "$postBuild"
+          '';
+        }
+      );
+    })
+
+    (mkIf cfg.fixDependencies {
+      # dbus reads its service directories from system.path at build time, which makes /etc (and
+      # every unit referring to the dbus config) depend on it. Resolve it at run time instead.
+      services.dbus.packages = mkForce (
+        map (p: if isSystemPath p then "/run/current-system/sw" else p) upstream.services.dbus.packages
+      );
+      environment.etc.terminfo.source = mkForce "/run/current-system/sw/share/terminfo";
+    })
+
+    {
+      # Detect when nixpkgs changes something we override. The tests check the outputs.
+      assertions = [
+        {
+          assertion =
+            cfg.systemdUnits -> lib.functionArgs upstreamGenerateUnits == lib.functionArgs generateUnits;
+          message = "nixosBuildHelpers.systemdUnits: the arguments of nixpkgs' generateUnits changed (${builtins.toJSON (lib.functionArgs upstreamGenerateUnits)}). nixos-build-helpers needs an update.";
+        }
+        {
+          assertion =
+            cfg.buildEnv
+            -> builtins.match upstreamBuildEnvCommand upstream.system.path.drvAttrs.buildCommand != null;
+          message = "nixosBuildHelpers.buildEnv: the build command of nixpkgs' buildEnv changed. nixos-build-helpers needs an update.";
+        }
+      ];
+      warnings =
+        lib.optional (cfg.fixDependencies && !lib.any isSystemPath upstream.services.dbus.packages)
+          "nixosBuildHelpers.fixDependencies: nixpkgs' services.dbus.packages no longer contains system.path, the dbus override is obsolete.";
+    }
+  ];
 }

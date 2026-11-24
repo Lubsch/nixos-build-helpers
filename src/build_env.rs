@@ -1,88 +1,18 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    env,
-    fs::{self, read_to_string},
-    os::unix::fs::symlink,
-    path::{Path, PathBuf},
-};
+//! Replacement for pkgs/build-support/buildenv/builder.pl.
+//!
+//! builder.pl walks all packages one after another and keeps a global map from relative path to
+//! (target, priority), recursing into directories when two packages provide one. Instead, we walk
+//! all packages at once: for every path we collect all contributions (in package order) and fold
+//! them with builder.pl's rules, which yields the same result in a single pass that creates the
+//! output while it goes.
 
-use anyhow::Context as _;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, read_to_string};
+use std::os::unix::fs::{MetadataExt as _, symlink};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context as _, Result, bail};
 use nanoserde::DeJson;
-
-pub fn run() -> anyhow::Result<()> {
-    let config_path = env::var("NIX_ATTRS_JSON_FILE")
-        .context("missing required environment variable NIX_ATTRS_JSON_FILE")?;
-    let config = read_to_string(config_path).context("cannot read structured attrs JSON file")?;
-    let args: Args = Args::deserialize_json(&config).context("config is invalid")?;
-
-    let store_dir = PathBuf::from(env::var("NIX_STORE").unwrap_or("/nix/store".into()));
-
-    let mut discovery = Discovery {
-        store_dir,
-        ignore_single_file_outputs: args.ignore_single_file_outputs,
-        ..Default::default()
-    };
-
-    let ignore_collisions = match args.ignore_collisions {
-        true => IgnoreCollisions::True,
-        false => IgnoreCollisions::False,
-    };
-
-    for pkg in &args.chosen_outputs {
-        for path in &pkg.paths {
-            if Path::new(path).try_exists()? {
-                discovery.add_root(path, pkg.priority, ignore_collisions)?;
-            }
-        }
-    }
-
-    let mut priority = 1000;
-    while !discovery.postponed.is_empty() {
-        for pkg in std::mem::take(&mut discovery.postponed) {
-            discovery.add_root(&pkg, priority, IgnoreCollisions::TrueDontWarn)?;
-            priority += 1;
-        }
-    }
-
-    if !args.extra_paths_from.is_empty() {
-        let content = read_to_string(&args.extra_paths_from)
-            .with_context(|| format!("cannot open extra paths file {:?}", args.extra_paths_from))?;
-        for pkg in content.lines() {
-            if Path::new(pkg).is_dir() {
-                discovery.add_root(pkg, 1000, ignore_collisions)?;
-            }
-        }
-    }
-
-    // Pre-create the pathsToLink entry chains (this also creates the output base
-    // and every forced ancestor directory), then fuse-walk.
-    let base = Path::new(&args.outputs.out).join(&args.extra_prefix);
-    fs::create_dir_all(&base)?;
-    for p in &args.paths_to_link {
-        fs::create_dir_all(base.join(p.strip_prefix('/').unwrap_or(p)))?;
-    }
-
-    // pathsToLink entries plus all their ancestors. These rel_names
-    // are always realized as real directories and always descended into, so that
-    // ancestors are traversed to reach their entry and empty entries still exist.
-    let forced: BTreeSet<String> = args
-        .paths_to_link
-        .iter()
-        .flat_map(|p| Path::new(p).ancestors())
-        .map(|p| p.to_str().unwrap().to_string())
-        .collect();
-
-    let nr_links = args.merge("", &base, &discovery.roots, &forced)?;
-
-    eprintln!("created {nr_links} symlinks in user environment");
-
-    if !args.manifest.is_empty() {
-        let manifest = Path::new(&args.outputs.out).join("manifest");
-        symlink(&args.manifest, manifest).context("cannot create manifest")?;
-    }
-
-    Ok(())
-}
 
 #[derive(Debug, DeJson)]
 struct Outputs {
@@ -96,7 +26,7 @@ struct ChosenOutput {
 }
 
 #[derive(Debug, DeJson)]
-struct Args {
+pub struct Args {
     outputs: Outputs,
     #[nserde(rename = "extraPrefix")]
     extra_prefix: String,
@@ -115,182 +45,290 @@ struct Args {
     manifest: String,
 }
 
-// Collision policy. The JSON only carries the user-facing bool; TrueDontWarn is
-// set in code for the propagated phase, mirroring the Perl ignoreCollisions = 2.
-#[derive(Debug, Clone, Copy)]
-enum IgnoreCollisions {
-    True,
-    False,
-    TrueDontWarn,
+/// builder.pl's `$ignoreCollisions`: 0, 1, or 2 (ignore silently, for propagated packages).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Collisions {
+    Fail,
+    Warn,
+    Ignore,
 }
 
-// A directory to walk: its real path, priority, and collision policy.
-type Root = (PathBuf, i32, IgnoreCollisions);
-
-// One package's contribution at a single child name.
-struct Contribution {
-    target: PathBuf,
+/// One package's file or directory at some relative path.
+#[derive(Debug, Clone)]
+struct Root {
+    path: PathBuf,
     priority: i32,
-    is_dir: bool,
+    collisions: Collisions,
+    /// File type, from readdir (and a stat for symlinks), so we stat each file at most once.
+    symlink: bool,
+    /// Perl's `-d`: a directory or a symlink to one
+    dir: bool,
     dangling: bool,
-    ignore_collisions: IgnoreCollisions,
+    /// Whether no component below the package's store path is a symlink, so that the path
+    /// resolves to itself (relative to the store).
+    real: bool,
 }
 
-impl Args {
-    // Depth-first merge of `dirs` into `out_dir` (which already exists). Creates
-    // symlinks at leaves and directories on descent, in one pass.
-    fn merge(
-        &self,
-        rel_name: &str,
-        out_dir: &Path,
-        dirs: &[Root],
-        forced: &BTreeSet<String>,
-    ) -> anyhow::Result<u32> {
-        let mut nr_links = 0;
-        // directories may collide; gather all contributions per child name, then resolve by priority.
-        let mut by_name: BTreeMap<String, Vec<Contribution>> = BTreeMap::new();
-        for &(ref target, priority, ignore_collisions) in dirs {
-            for entry in fs::read_dir(target)? {
+pub fn run(args: Args) -> Result<()> {
+    let store_dir = std::env::var("NIX_STORE").unwrap_or("/nix/store".into());
+    let collisions = if args.ignore_collisions {
+        Collisions::Warn
+    } else {
+        Collisions::Fail
+    };
+    let mut d = Discovery {
+        store_dir: PathBuf::from(store_dir),
+        ignore_single_file_outputs: args.ignore_single_file_outputs,
+        ..Default::default()
+    };
+
+    // The packages that have been installed explicitly.
+    for pkg in &args.chosen_outputs {
+        for path in &pkg.paths {
+            if Path::new(path).exists() {
+                d.add(path, pkg.priority, collisions)?;
+            }
+        }
+    }
+    // Packages propagated by them, with lower priority (we don't care about their collisions).
+    let mut priority = 1000;
+    while !d.postponed.is_empty() {
+        for pkg in std::mem::take(&mut d.postponed) {
+            d.add(&pkg, priority, Collisions::Ignore)?;
+            priority += 1;
+        }
+    }
+    if !args.extra_paths_from.is_empty() {
+        let content = read_to_string(&args.extra_paths_from)
+            .with_context(|| format!("cannot open extra paths file {:?}", args.extra_paths_from))?;
+        for pkg in content.lines() {
+            if Path::new(pkg).is_dir() {
+                d.add(pkg, 1000, collisions)?;
+            }
+        }
+    }
+
+    // pathsToLink and their ancestors are always directories.
+    let mut forced = BTreeSet::from([String::new()]);
+    for p in &args.paths_to_link {
+        let mut cur = String::new();
+        for part in p.split('/').filter(|s| !s.is_empty()) {
+            cur = format!("{cur}/{part}");
+            forced.insert(cur.clone());
+        }
+    }
+
+    let base = Path::new(&args.outputs.out).join(args.extra_prefix.trim_start_matches('/'));
+    fs::create_dir_all(&base)?;
+    let ctx = Ctx {
+        args: &args,
+        forced,
+    };
+    let nr_links = ctx.merge("", &base, &d.roots)?;
+    // Create the pathsToLink that no package provides.
+    for p in &args.paths_to_link {
+        fs::create_dir_all(base.join(p.trim_start_matches('/')))?;
+    }
+    eprintln!("created {nr_links} symlinks in user environment");
+
+    if !args.manifest.is_empty() {
+        symlink(
+            &args.manifest,
+            Path::new(&args.outputs.out).join("manifest"),
+        )
+        .context("cannot create manifest")?;
+    }
+    Ok(())
+}
+
+struct Ctx<'a> {
+    args: &'a Args,
+    forced: BTreeSet<String>,
+}
+
+/// What a relative path ends up as, while folding its contributions.
+enum Node {
+    /// A symlink to `target` (a file or directory). `root` is the full contribution.
+    Link(Root),
+    /// A directory merging these package directories. (Its priority is never used.)
+    Dir(Vec<Root>),
+}
+
+impl Ctx<'_> {
+    /// Create `out_dir`'s contents (`out_dir` exists) from the directories `dirs` at `rel`.
+    fn merge(&self, rel: &str, out_dir: &Path, dirs: &[Root]) -> Result<u32> {
+        // Contributions per child name, in package order.
+        let mut children: BTreeMap<String, Vec<Root>> = BTreeMap::new();
+        for dir in dirs {
+            for entry in
+                fs::read_dir(&dir.path).with_context(|| format!("cannot open {:?}", dir.path))?
+            {
                 let entry = entry?;
                 let name = entry.file_name();
                 let name = name
                     .to_str()
-                    .with_context(|| format!("non-UTF-8 filename under {target:?}: {name:?}"))?;
-                let child_rel = [rel_name, name].join("/");
-
-                if skip(&child_rel, &self.paths_to_link) {
+                    .with_context(|| format!("non-UTF-8 file name in {:?}: {name:?}", dir.path))?;
+                if self.skip(&format!("{rel}/{name}"), name) {
                     continue;
                 }
-
-                let child_target = target.join(name);
-
-                // (is_dir, dangling) for a surviving entry. Only called after `skip`, so pruned
-                // entries are never classified; only symlinks need the follow-up stat.
-                let ftype = entry.file_type()?;
-                let (is_dir, dangling) = if ftype.is_symlink() {
-                    match fs::metadata(&child_target) {
-                        Ok(m) => (m.is_dir(), false),
-                        Err(_) => (false, true), // dangling symlink: treated as a leaf
-                    }
-                } else {
-                    (ftype.is_dir(), false)
+                let path = dir.path.join(name);
+                let symlink = entry.file_type()?.is_symlink();
+                let (is_dir, dangling) = match symlink {
+                    true => fs::metadata(&path).map_or((false, true), |m| (m.is_dir(), false)),
+                    false => (entry.file_type()?.is_dir(), false),
                 };
-
-                let contrib = Contribution {
-                    target: child_target,
-                    priority,
-                    is_dir,
+                children.entry(name.to_string()).or_default().push(Root {
+                    path,
+                    symlink,
+                    dir: is_dir,
                     dangling,
-                    ignore_collisions,
-                };
-                by_name.entry(name.to_string()).or_default().push(contrib);
+                    real: dir.real && !symlink,
+                    ..dir.clone()
+                });
             }
         }
 
-        for (name, mut contribs) in by_name {
-            let child_out = out_dir.join(&name);
-
-            // Lowest priority number wins; stable so ties keep discovery order.
-            contribs.sort_by_key(|c| c.priority);
-            let winner = &contribs[0];
-
-            // A file winner shadows everything: one symlink.
-            if !winner.is_dir {
-                // Handle genuine file/file collision, evaluated under the rival's own policy
-                // (propagated rivals stay silent).
-                for rival in contribs.iter().skip(1).filter(|rival| {
-                    rival.priority == winner.priority && rival.target != winner.target
-                }) {
-                    match rival.ignore_collisions {
-                        IgnoreCollisions::True => eprintln!(
-                            "colliding subpath (ignored): {:?} and {:?}",
-                            winner.target, rival.target
-                        ),
-                        IgnoreCollisions::TrueDontWarn => {}
-                        IgnoreCollisions::False
-                            if self.check_collision_contents
-                                && check_collision(&winner.target, &rival.target)? => {}
-                        IgnoreCollisions::False => anyhow::bail!(
-                            "two given paths contain a conflicting subpath:\n  {:?} and\n  {:?}\n\
-                            hint: this may be caused by two different versions of the same package",
-                            winner.target,
-                            rival.target,
-                        ),
+        let mut nr_links = 0;
+        for (name, contributions) in children {
+            let child_rel = format!("{rel}/{name}");
+            let out = out_dir.join(&name);
+            match self.fold(&child_rel, contributions)? {
+                Node::Link(root) => {
+                    if root.dangling {
+                        let link = fs::read_link(&root.path)?;
+                        eprintln!(
+                            "creating dangling symlink {out:?} -> {:?} -> {link:?}",
+                            root.path
+                        );
                     }
+                    // (Everything outside pathsToLink is skipped or a forced directory.)
+                    symlink(&root.path, &out)?;
+                    nr_links += 1;
                 }
-
-                link_leaf(&child_out, &winner.target, winner.dangling)?;
-                nr_links += 1;
-                continue;
+                Node::Dir(roots) => {
+                    fs::create_dir_all(&out)?;
+                    nr_links += self.merge(&child_rel, &out, &roots)?;
+                }
             }
-
-            // Directory winner: only directory contributors merge.
-            let dir_contribs: Vec<Root> = contribs
-                .iter()
-                .filter(|c| c.is_dir)
-                .map(|c| (c.target.clone(), c.priority, c.ignore_collisions))
-                .collect();
-
-            let child_rel = [rel_name, &name].join("/");
-
-            // A lone, unforced directory links whole; forced dirs and multi-dir
-            // nodes become real directories we descend into.
-            if dir_contribs.len() == 1 && !forced.contains(&child_rel) {
-                link_leaf(&child_out, &winner.target, false)?;
-                nr_links += 1;
-                continue;
-            }
-
-            if !forced.contains(&child_rel) {
-                fs::create_dir(&child_out)?;
-            }
-            nr_links += self.merge(&child_rel, &child_out, &dir_contribs, forced)?;
         }
-
         Ok(nr_links)
     }
+
+    /// builder.pl's `findFiles`, for all contributions to one path.
+    fn fold(&self, rel: &str, contributions: Vec<Root>) -> Result<Node> {
+        let mut node = self.forced.contains(rel).then(|| Node::Dir(vec![]));
+
+        for new in contributions {
+            let Some(old) = node.take() else {
+                node = Some(Node::Link(new));
+                continue;
+            };
+            node = Some(match old {
+                // A symlink to a file in a lower-priority package is overwritten.
+                Node::Link(old) if new.priority < old.priority && !old.dir => Node::Link(new),
+                // Both resolve to the same file: prefer the one that isn't a symlink.
+                Node::Link(old) if same_file(&old, &new) => {
+                    if old.symlink && !new.symlink {
+                        Node::Link(new)
+                    } else {
+                        Node::Link(old)
+                    }
+                }
+                // A symlink to a file in a higher-priority package stays.
+                Node::Link(old) if new.priority > old.priority && !old.dir => Node::Link(old),
+                Node::Dir(_) if !new.dir => bail!("not a directory: `{:?}'", new.path),
+                Node::Dir(mut roots) => {
+                    roots.push(new);
+                    Node::Dir(roots)
+                }
+                Node::Link(old) if old.dir && new.dir => Node::Dir(vec![old, new]),
+                Node::Link(old) => {
+                    self.collision(&old.path, &new)?;
+                    Node::Link(old)
+                }
+            });
+        }
+        Ok(node.expect("a path without contributions"))
+    }
+
+    /// Two different files at one path, of which `old` wins. Fails unless it may be ignored.
+    fn collision(&self, old: &Path, new: &Root) -> Result<()> {
+        match new.collisions {
+            Collisions::Ignore => Ok(()),
+            Collisions::Warn => {
+                eprintln!("colliding subpath (ignored): {:?} and {old:?}", new.path);
+                Ok(())
+            }
+            Collisions::Fail
+                if self.args.check_collision_contents && same_contents(old, &new.path)? =>
+            {
+                Ok(())
+            }
+            Collisions::Fail => bail!(
+                "two given paths contain a conflicting subpath:\n  {:?} and\n  {old:?}\n\
+                 hint: this may be caused by two different versions of the same package in buildEnv's `paths` parameter\n\
+                 hint: `pkgs.nix-diff` can be used to compare derivations",
+                new.path
+            ),
+        }
+    }
+
+    /// Paths that are never linked: builder.pl's "Urgh, hacky..." list and paths outside pathsToLink.
+    fn skip(&self, rel: &str, name: &str) -> bool {
+        matches!(rel, "/propagated-build-inputs" | "/nix-support")
+            || rel.ends_with("info/dir")
+            || (rel.starts_with("/share/mime/") && !rel.starts_with("/share/mime/packages"))
+            || matches!(name, "perllocal.pod" | "log")
+            || !(self.has_paths_to_link(rel) || self.in_paths_to_link(rel))
+    }
+
+    /// Whether `rel` is at or below a pathsToLink entry.
+    fn in_paths_to_link(&self, rel: &str) -> bool {
+        let rel = if rel.is_empty() { "/" } else { rel };
+        self.args
+            .paths_to_link
+            .iter()
+            .any(|p| p == "/" || is_at_or_below(rel, p))
+    }
+
+    /// Whether `rel` may contain files in a pathsToLink entry.
+    fn has_paths_to_link(&self, rel: &str) -> bool {
+        self.args
+            .paths_to_link
+            .iter()
+            .any(|p| rel.is_empty() || is_at_or_below(p, rel))
+    }
 }
 
-fn skip(child_rel: &str, paths_to_link: &[String]) -> bool {
-    let base = child_rel.rsplit('/').next();
-    matches!(child_rel, "/propagated-build-inputs" | "/nix-support")
-        || child_rel.ends_with("info/dir")
-        || (child_rel.starts_with("/share/mime/") && !child_rel.starts_with("/share/mime/packages"))
-        || matches!(base, Some("perllocal.pod" | "log"))
-        || !(
-            // Is `path` at or above some pathsToLink entry? (must descend through it)
-            child_rel.is_empty()
-                || paths_to_link.iter().any(|p| {
-                    p == child_rel || (p.starts_with(child_rel) && p.as_bytes().get(child_rel.len()) == Some(&b'/'))
-                })
-            // Is `path` at or below some pathsToLink entry? (its subtree is wanted)
-            // `p == "/"` matches everything, mirroring the Perl special case.
-            || paths_to_link.iter().any(|p| {
-                    p == "/"
-                        ||  p == child_rel
-                        || (child_rel.starts_with(p.as_str()) && child_rel.as_bytes().get(p.len()) == Some(&b'/'))
-                })
-        )
+fn is_at_or_below(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-// Compare two files byte-for-byte; a permission mismatch counts as differing.
-fn check_collision(a: &Path, b: &Path) -> anyhow::Result<bool> {
-    let ap = fs::metadata(a)?.permissions();
-    let bp = fs::metadata(b)?.permissions();
-    if ap != bp {
-        eprintln!("different permissions in {a:?} and {b:?}: {ap:?} <-> {bp:?}");
+/// Perl's `abs_path($a) eq abs_path($b)`, false if either doesn't resolve.
+fn same_file(a: &Root, b: &Root) -> bool {
+    // Different paths without symlinks can't resolve to the same file. This skips resolving
+    // (a readlink per path component) for almost all collisions.
+    if a.real && b.real {
+        return a.path == b.path;
+    }
+    matches!((fs::canonicalize(&a.path), fs::canonicalize(&b.path)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// builder.pl's `checkCollision`: same mode (including the file type) and contents.
+fn same_contents(a: &Path, b: &Path) -> Result<bool> {
+    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else {
+        return Ok(false);
+    };
+    if ma.mode() != mb.mode() {
+        eprintln!(
+            "different permissions in {a:?} and {b:?}: {:04o} <-> {:04o}",
+            ma.mode() & 0o7777,
+            mb.mode() & 0o7777
+        );
         return Ok(false);
     }
-    Ok(fs::read(a)? == fs::read(b)?)
-}
-
-// Emit one symlink (a file leaf, a dangling leaf, or a linked-whole directory).
-fn link_leaf(out: &Path, target: &Path, dangling: bool) -> std::io::Result<()> {
-    if dangling {
-        let link = fs::read_link(target).unwrap_or_default();
-        eprintln!("creating dangling symlink `{out:?}' -> `{target:?}' -> `{link:?}'");
-    }
-    symlink(target, out)
+    Ok(ma.is_file() && fs::read(a)? == fs::read(b)?)
 }
 
 #[derive(Default)]
@@ -303,31 +341,36 @@ struct Discovery {
 }
 
 impl Discovery {
-    // Append a package root if unseen; queue its propagated packages.
-    fn add_root(
-        &mut self,
-        pkg_dir: &str,
-        priority: i32,
-        policy: IgnoreCollisions,
-    ) -> anyhow::Result<()> {
-        if !self.done.insert(pkg_dir.to_string()) {
+    /// builder.pl's `addPkg`: add a package if unseen, and queue the packages it propagates.
+    fn add(&mut self, pkg: &str, priority: i32, collisions: Collisions) -> Result<()> {
+        if !self.done.insert(pkg.to_string()) {
             return Ok(());
         }
-
-        let pkg_path = Path::new(pkg_dir);
-        if pkg_path.is_file() && pkg_path.starts_with(&self.store_dir) {
+        let path = Path::new(pkg);
+        if path.is_file() && path.parent() == Some(&self.store_dir) {
             if self.ignore_single_file_outputs {
-                eprintln!("The store path {pkg_path:?} is a file and can't be merged, ignoring it");
+                eprintln!(
+                    "The store path {pkg} is a file and can't be merged into an environment using pkgs.buildEnv, ignoring it"
+                );
                 return Ok(());
             }
-            anyhow::bail!("The store path {pkg_path:?} is a file and can't be merged!");
+            bail!(
+                "The store path {pkg} is a file and can't be merged into an environment using pkgs.buildEnv!"
+            );
         }
+        self.roots.push(Root {
+            path: path.to_path_buf(),
+            priority,
+            collisions,
+            symlink: path.is_symlink(),
+            dir: path.is_dir(),
+            dangling: false,
+            real: !path.is_symlink(),
+        });
 
-        self.roots.push((pkg_path.to_path_buf(), priority, policy));
-
-        let propagated = pkg_path.join("nix-support/propagated-user-env-packages");
-        if let Ok(content) = read_to_string(&propagated) {
-            for p in content.split_whitespace() {
+        // builder.pl only reads the first line.
+        if let Ok(content) = read_to_string(path.join("nix-support/propagated-user-env-packages")) {
+            for p in content.lines().next().unwrap_or("").split_whitespace() {
                 if !self.done.contains(p) {
                     self.postponed.insert(p.to_string());
                 }
