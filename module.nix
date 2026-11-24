@@ -97,6 +97,7 @@ let
       __structuredAttrs = true;
       preferLocalBuild = true;
       allowSubstitutes = false;
+      outputs = [ "out" ] ++ lib.optional cfg.fewerDerivations "files";
       inherit
         allowCollisions
         type
@@ -106,15 +107,35 @@ let
         package
         ;
       inherit (config.systemd) defaultUnit ctrlAltDelUnit;
-      units = lib.mapAttrs (_: u: {
-        unit = "${u.unit}";
-        overrideStrategy = u.overrideStrategy or "asDropinIfExists";
-        aliases = u.aliases or [ ];
-        wantedBy = u.wantedBy or [ ];
-        upheldBy = u.upheldBy or [ ];
-        requiredBy = u.requiredBy or [ ];
-      }) units;
+      units = lib.mapAttrs (
+        name: u:
+        let
+          inline = cfg.fewerDerivations && isMadeFromText name u;
+        in
+        {
+          # With fewerDerivations, the unit files are written to the `files` output instead of
+          # one derivation each, unless their derivation was replaced.
+          unit = if inline then null else "${u.unit}";
+          text = if inline && u.enable then u.text or "" else null;
+          overrideStrategy = u.overrideStrategy or "asDropinIfExists";
+          aliases = u.aliases or [ ];
+          wantedBy = u.wantedBy or [ ];
+          upheldBy = u.upheldBy or [ ];
+          requiredBy = u.requiredBy or [ ];
+        }
+      ) units;
     } "${exe} generate-units";
+
+  # Whether a unit's derivation is still upstream's makeUnit of its text.
+  isMadeFromText =
+    name: u:
+    let
+      drvName = "unit-${upstreamUtils.systemdUtils.lib.mkPathSafeName name}";
+    in
+    if u.enable then
+      u.unit.name or null == drvName && u.unit.text or null == u.text or ""
+    else
+      u.unit.name or null == "${drvName}-disabled";
 
   overlay = config.system.etc.overlay.enable;
 
@@ -180,7 +201,7 @@ in
     systemdUnits = mkEnableOption "the faster builder for systemd units (system-units, user-units, initrd-units, nspawn-units)";
     buildEnv = mkEnableOption "the faster builder for `system.path`";
     fixDependencies = mkEnableOption "removing the dependency of /etc on `system.path`, so they build in parallel and /etc isn't rebuilt when only packages change";
-    fewerDerivations = mkEnableOption "fewer derivations on the way from a change to the toplevel: `environment.etc.*.text` that refers to no store paths is written at evaluation time (`builtins.toFile`), and the activation script and boot.json don't depend on /etc";
+    fewerDerivations = mkEnableOption "fewer derivations on the way from a change to the toplevel: `environment.etc.*.text` that refers to no store paths is written at evaluation time (`builtins.toFile`), the activation script and boot.json don't depend on /etc, and with `systemdUnits`, units are written by the units' derivation instead of one derivation each";
   };
 
   # Extend the submodule of environment.etc with a stronger definition of `source`.

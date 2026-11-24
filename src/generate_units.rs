@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, create_dir_all, read_link, remove_file};
 use std::io::ErrorKind::AlreadyExists;
 use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use nanoserde::DeJson;
@@ -13,7 +13,11 @@ use crate::{file_name, glob_dir};
 
 #[derive(DeJson, Debug)]
 struct Unit {
-    unit: String,
+    /// The unit's derivation, containing the unit file. Absent if the unit is written from `text`.
+    unit: Option<String>,
+    /// The unit file's contents, written to the `files` output. Absent for a disabled unit
+    /// (linked to /dev/null, like upstream's derivation).
+    text: Option<String>,
     #[nserde(rename = "overrideStrategy")]
     override_strategy: String,
     aliases: Vec<String>,
@@ -53,6 +57,9 @@ pub fn run(args: Args, out: &Path) -> Result<()> {
         t => bail!("type must be one of system | initrd | user | nspawn, got {t:?}"),
     };
     create_dir_all(out)?;
+    if let Ok(files) = std::env::var("files") {
+        create_dir_all(files)?; // also if no unit is written from text
+    }
     let upstream = Path::new(&args.package)
         .join("example/systemd")
         .join(type_dir);
@@ -115,13 +122,25 @@ pub fn run(args: Args, out: &Path) -> Result<()> {
 
     // Symlink units defined by systemd.units. With asDropinIfExists, units that are also provided
     // by systemd or systemd.packages become <unit>.d/overrides.conf, extending the upstream unit.
-    for u in args.units.values() {
-        // A unit derivation contains exactly one file, the unit.
-        let dir = Path::new(&u.unit);
-        let src = fs::read_dir(dir)?
-            .next()
-            .context("empty unit derivation")??
-            .path();
+    for (name, u) in &args.units {
+        let src = match &u.unit {
+            // A unit derivation contains exactly one file, the unit.
+            Some(dir) => fs::read_dir(dir)?
+                .next()
+                .context("empty unit derivation")??
+                .path(),
+            // Like a unit derivation, but all in one output, which is outside of systemd's search
+            // path, so that systemd still sees the units as linked.
+            None => {
+                let files = PathBuf::from(std::env::var("files").context("$files is unset")?);
+                let src = files.join(name);
+                match &u.text {
+                    Some(text) => fs::write(&src, text)?,
+                    None => symlink("/dev/null", &src)?,
+                }
+                src
+            }
+        };
         let name = file_name(&src)?;
         let out_p = out.join(name);
         let as_dropin = || -> Result<()> {

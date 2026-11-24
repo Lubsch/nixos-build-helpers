@@ -72,6 +72,8 @@ let
           "buildEnv"
           "fewerDerivations"
         ];
+        # Units link the same files, but from one output instead of a derivation each.
+        deref = fewer && c.nixosBuildHelpers.systemdUnits;
       }) units
       // {
         system-path = {
@@ -139,11 +141,13 @@ let
           inputs,
           ignore ? [ ],
           subst ? [ ],
+          deref ? false,
         }:
         let
           normalize = lib.any (o: opts.${o}) inputs;
           flags =
             lib.optional normalize "--normalize"
+            ++ lib.optional deref "--deref"
             ++ lib.concatMap (i: [
               "--ignore"
               i
@@ -230,6 +234,10 @@ let
     featureful-fixDependencies = mkTest "featureful" false { fixDependencies = true; };
     featureful-fewerDerivations = mkTest "featureful" false { fewerDerivations = true; };
     featureful-overlay-fewerDerivations = mkTest "featureful" true { fewerDerivations = true; };
+    featureful-fewerDerivations-systemdUnits = mkTest "featureful" false {
+      fewerDerivations = true;
+      systemdUnits = true;
+    };
     featureful-all = mkTest "featureful" false (all // { etc = true; });
     featureful-overlay-all = mkTest "featureful" true (all // { etcOverlay = true; });
     minimal-all = mkTest "minimal" false (all // { etc = true; });

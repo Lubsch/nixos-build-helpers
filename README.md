@@ -29,9 +29,16 @@ level costs ~0.1 s, mostly nix's scheduling, even when the build itself takes mi
   `$systemConfig` at run time, instead of having their store paths built in. The overlay
   snippet is still upstream's, with only those paths replaced.
 - boot.json gets nixos-init's /etc paths added in the toplevel builder.
+- With `systemdUnits`, the units' derivation writes the unit files itself, into a second output
+  (`system-units-files`), instead of one derivation per unit. The units still link there, i.e.
+  outside of systemd's search path, so systemd sees them as before (e.g. as "linked"; the VM
+  test compares `systemctl list-unit-files` with a system without nixos-build-helpers). Units
+  whose `unit` was set to something else than upstream's derivation of their `text` are linked
+  as before. This costs ~100 KiB per generation instead of sharing unchanged units.
 
-So `activate` and `boot.json` no longer depend on /etc, and after editing a plain /etc file only
-/etc and the toplevel are built.
+So `activate` and `boot.json` no longer depend on /etc: after editing a plain /etc file, only
+/etc and the toplevel are built, and after editing a service, its script, the units, /etc and
+the toplevel.
 
 ## Results
 
@@ -76,7 +83,7 @@ differences are, and what makes the current version faster: it creates ~1400 few
 |---|---|---|---|
 | edit a file in /etc | 2.2 s | 1.6 s | 8 → 2 |
 | add a package | 4.8 s | 2.5 s | 17 → 7 |
-| edit a service | 3.6 s | 1.8 s | 10 → 5 |
+| edit a service | 3.6 s | 1.8 s | 10 → 4 |
 
 With iets as evaluator (eval ~0.9 s). With nix 2.34, eval takes ~5.5 s instead and dominates the
 total.

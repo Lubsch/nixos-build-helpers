@@ -5,20 +5,10 @@
   overlay,
   module ? ../module.nix,
 }:
-testers.runNixOSTest {
-  name = "nixos-build-helpers${if overlay then "-overlay" else ""}";
-  nodes.machine =
+let
+  config =
     { pkgs, ... }:
     {
-      imports = [ module ];
-      nixosBuildHelpers = {
-        etc = !overlay;
-        etcOverlay = overlay;
-        systemdUnits = true;
-        buildEnv = true;
-        fixDependencies = true;
-        fewerDerivations = true;
-      };
       system.etc.overlay.enable = overlay;
       boot.initrd.systemd.enable = true;
       services.userborn.enable = overlay;
@@ -36,15 +26,50 @@ testers.runNixOSTest {
         serviceConfig.RemainAfterExit = true;
         script = "true";
       };
+      systemd.user.services.nbh-test-user = {
+        wantedBy = [ "default.target" ];
+        script = "true";
+      };
       # A system to switch to, changing a unit and a file in /etc
       specialisation.changed.configuration = {
         systemd.services.nbh-test.environment.CHANGED = "1";
         environment.etc."nbh-test".text = pkgs.lib.mkForce "changed";
       };
     };
+in
+testers.runNixOSTest {
+  name = "nixos-build-helpers${if overlay then "-overlay" else ""}";
+  nodes.machine = {
+    imports = [
+      config
+      module
+    ];
+    nixosBuildHelpers = {
+      etc = !overlay;
+      etcOverlay = overlay;
+      systemdUnits = true;
+      buildEnv = true;
+      fixDependencies = true;
+      fewerDerivations = true;
+    };
+  };
+  # The same system without nixos-build-helpers
+  nodes.reference = config;
 
   testScript = ''
+    import re
+    start_all()
     machine.wait_for_unit("multi-user.target")
+    reference.wait_for_unit("multi-user.target")
+
+    # systemd sees the same unit files, in the same states (e.g. linked, enabled, static)
+    for cmd in ["systemctl list-unit-files --no-legend --no-pager",
+                "systemctl --global list-unit-files --no-legend --no-pager",
+                "systemctl show -p UnitFileState,FragmentPath,DropInPaths,Names nbh-test.service systemd-journald.service"]:
+        # (Paths in the store differ, e.g. DropInPaths in system-units without the overlay.)
+        ours, theirs = (re.sub("/nix/store/[a-z0-9]{32}-", "/nix/store/<hash>-", m.succeed(cmd)) for m in (machine, reference))
+        assert ours == theirs, f"{cmd}:\n{ours}\nvs. without nixos-build-helpers:\n{theirs}"
+
     machine.succeed("systemctl is-active nbh-test.service")
     assert machine.succeed("systemctl --failed --no-legend") == "", "failed units"
     # /etc
