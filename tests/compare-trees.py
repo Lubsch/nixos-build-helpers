@@ -1,12 +1,14 @@
 """Compare two file trees (or composefs dumps) without following symlinks.
 
-Usage: compare-trees.py [--normalize] [--ignore NAME]... REFERENCE TEST
+Usage: compare-trees.py [--normalize] [--ignore NAME]... [--subst FROM=TO]... REFERENCE TEST
 
 Symlink targets are compared textually and regular files by permissions and content.
 --normalize replaces store path hashes in symlink targets and file contents. Use it when
 REFERENCE and TEST point to derivations that differ only because their inputs were built by a
 different (separately tested) builder, e.g. units referring to system.path.
 --ignore skips a top-level entry.
+--subst replaces FROM by TO in the contents of TEST's files (after normalizing), for differences
+that are intended.
 """
 
 import hashlib
@@ -18,13 +20,16 @@ from pathlib import Path
 STORE_HASH = re.compile(rb"/nix/store/[0-9a-z]{32}-")
 
 
-def normalize(data: bytes, enabled: bool) -> bytes:
-    return STORE_HASH.sub(b"/nix/store/<hash>-", data) if enabled else data
+def normalize(data: bytes, enabled: bool, subst: list[tuple[bytes, bytes]] = []) -> bytes:
+    data = STORE_HASH.sub(b"/nix/store/<hash>-", data) if enabled else data
+    for a, b in subst:
+        data = data.replace(a, b)
+    return data
 
 
-def listing(root: Path, norm: bool) -> dict[str, str]:
+def listing(root: Path, norm: bool, subst: list[tuple[bytes, bytes]] = []) -> dict[str, str]:
     if root.is_file():  # a single file, e.g. a composefs dump
-        return {".": hashlib.sha256(normalize(root.read_bytes(), norm)).hexdigest()}
+        return {".": hashlib.sha256(normalize(root.read_bytes(), norm, subst)).hexdigest()}
     entries = {}
     for dirpath, dirnames, filenames in os.walk(root):
         for name in dirnames + filenames:
@@ -37,21 +42,24 @@ def listing(root: Path, norm: bool) -> dict[str, str]:
             elif path.is_dir():
                 entries[rel] = f"dir {st.st_mode & 0o7777:o}"
             else:
-                digest = hashlib.sha256(normalize(path.read_bytes(), norm)).hexdigest()
+                digest = hashlib.sha256(normalize(path.read_bytes(), norm, subst)).hexdigest()
                 entries[rel] = f"file {st.st_mode & 0o7777:o} {digest[:16]}"
     return entries
 
 
 def main() -> int:
-    args, ignore, norm = sys.argv[1:], set(), False
+    args, ignore, norm, subst = sys.argv[1:], set(), False, []
     while args[0].startswith("--"):
         opt = args.pop(0)
         if opt == "--normalize":
             norm = True
         elif opt == "--ignore":
             ignore.add(args.pop(0))
+        elif opt == "--subst":
+            frm, to = args.pop(0).split("=", 1)
+            subst.append((frm.encode(), to.encode()))
     ref, test = (Path(a) for a in args)
-    a, b = listing(ref, norm), listing(test, norm)
+    a, b = listing(ref, norm), listing(test, norm, subst)
     bad = 0
     for rel in sorted((a.keys() | b.keys()) - ignore):
         if a.get(rel) != b.get(rel):

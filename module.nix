@@ -2,6 +2,7 @@
   config,
   lib,
   pkgs,
+  options,
   modulesPath,
   extendModules,
   ...
@@ -15,16 +16,16 @@ let
   # This system without any of our overrides. It shares `pkgs`, so evaluating values from it is
   # cheap. Wrapping upstream's values instead of copying their definitions keeps us in sync with
   # nixpkgs, e.g. system.path's postBuild or modules adding to services.dbus.packages.
-  upstream =
-    (extendModules {
-      modules = [
-        # Stronger than mkForce, so that this also works on variants that mkForce our options.
-        (lib.mkOverride 1 {
-          nixosBuildHelpers = lib.mapAttrs (_: _: false) cfg;
-          nixpkgs.pkgs = pkgs;
-        })
-      ];
-    }).config;
+  upstreamSystem = extendModules {
+    modules = [
+      # Stronger than mkForce, so that this also works on variants that mkForce our options.
+      (lib.mkOverride 1 {
+        nixosBuildHelpers = lib.mapAttrs (_: _: false) cfg;
+        nixpkgs.pkgs = pkgs;
+      })
+    ];
+  };
+  upstream = upstreamSystem.config;
 
   # Comparing derivations (==) would evaluate upstream's system.path just for that (~0.2 s).
   isSystemPath = p: lib.isDerivation p && p.name == upstream.system.path.name;
@@ -115,6 +116,60 @@ let
       }) units;
     } "${exe} generate-units";
 
+  overlay = config.system.etc.overlay.enable;
+
+  # With fewerDerivations, the activation script finds /etc through the toplevel at run time, so
+  # that it doesn't depend on (and isn't rebuilt with) /etc. Resolved to the store paths
+  # upstream's script uses, e.g. to compare with /run/current-system/etc.
+  atActivation = {
+    etc = ''$(readlink -f "$systemConfig/etc")'';
+    image = ''$(readlink -f "$systemConfig/etc-metadata-image")'';
+    basedir = ''$(readlink -f "$systemConfig/etc-basedir")'';
+  };
+
+  # Upstream's overlay activation snippet with the paths of /etc replaced. It's taken from the
+  # system without our options, with placeholders for those paths, so that neither upstream's
+  # /etc (all its builders) has to be evaluated, nor the snippet copied.
+  overlayActivationCommands =
+    let
+      placeholders = {
+        etc = "@nixosBuildHelpers-etc@";
+        image = "@nixosBuildHelpers-etc-metadata-image@";
+        basedir = "@nixosBuildHelpers-etc-basedir@";
+      };
+      upstreamCommands =
+        (upstreamSystem.extendModules {
+          modules = [
+            {
+              system.build = {
+                etc = mkForce { outPath = placeholders.etc; };
+                etcMetadataImage = mkForce placeholders.image;
+                etcBasedir = mkForce placeholders.basedir;
+              };
+            }
+          ];
+        }).config.system.build.etcActivationCommands;
+    in
+    # The image is all that the remount needs (e.g. nixpkgs#533343 removes the comparison).
+    assert lib.assertMsg (lib.hasInfix placeholders.image upstreamCommands)
+      "nixosBuildHelpers.fewerDerivations: nixpkgs' etc activation commands changed. nixos-build-helpers needs an update.";
+    builtins.replaceStrings
+      [
+        "${placeholders.etc}/etc"
+        placeholders.image
+        placeholders.basedir
+      ]
+      [
+        atActivation.etc
+        atActivation.image
+        atActivation.basedir
+      ]
+      upstreamCommands;
+
+  # Text that refers to no store paths can be written at evaluation time, without a derivation.
+  # (Not if it mentions store paths without context: a derivation would find those references.)
+  isPlainText = text: !builtins.hasContext text && !lib.hasInfix builtins.storeDir text;
+
   # The shape of upstream's build command for buildEnv, which we replace.
   upstreamBuildEnvCommand = builtins.unsafeDiscardStringContext "${pkgs.buildPackages.perl}/bin/perl -w ${builtins.storeDir}/[a-z0-9]{32}-builder.pl\neval \"\\$postBuild\"\n";
 in
@@ -125,6 +180,29 @@ in
     systemdUnits = mkEnableOption "the faster builder for systemd units (system-units, user-units, initrd-units, nspawn-units)";
     buildEnv = mkEnableOption "the faster builder for `system.path`";
     fixDependencies = mkEnableOption "removing the dependency of /etc on `system.path`, so they build in parallel and /etc isn't rebuilt when only packages change";
+    fewerDerivations = mkEnableOption "fewer derivations on the way from a change to the toplevel: `environment.etc.*.text` that refers to no store paths is written at evaluation time (`builtins.toFile`), and the activation script and boot.json don't depend on /etc";
+  };
+
+  # Extend the submodule of environment.etc with a stronger definition of `source`.
+  options.environment.etc = lib.mkOption {
+    type = lib.types.attrsOf (
+      lib.types.submodule (
+        {
+          name,
+          config,
+          options,
+          ...
+        }:
+        {
+          config.source = mkIf (cfg.fewerDerivations && config.text != null && isPlainText config.text) (
+            # upstream: mkDerivedConfig options.text (pkgs.writeText name')
+            lib.mkOverride ((options.text.highestPrio or lib.modules.defaultOverridePriority) - 1) (
+              builtins.toFile ("etc-" + lib.replaceStrings [ "/" ] [ "-" ] name) config.text
+            )
+          );
+        }
+      )
+    );
   };
 
   config = lib.mkMerge [
@@ -150,7 +228,7 @@ in
       system.build.etcMetadataImage = mkForce etc."metadata.erofs";
     })
 
-    (mkIf ((cfg.etc || cfg.etcOverlay) && !config.system.etc.overlay.enable) {
+    (mkIf ((cfg.etc || cfg.etcOverlay || cfg.fewerDerivations) && !overlay) {
       # Upstream's activation refers to its own etc derivation instead of system.build.etc, which
       # would build both. Same as upstream otherwise (the tests compare the toplevels).
       system.build.etcActivationCommands = mkForce ''
@@ -161,7 +239,33 @@ in
             path = modulesPath + "/system/etc/setup-etc.pl";
             name = "setup-etc.pl";
           }
-        } ${config.system.build.etc}/etc
+        } ${if cfg.fewerDerivations then atActivation.etc else "${config.system.build.etc}/etc"}
+      '';
+    })
+
+    (mkIf cfg.fewerDerivations {
+      system.systemBuilderCommands = lib.optionalString overlay ''
+        ln -s ${config.system.build.etcMetadataImage} $out/etc-metadata-image
+        ln -s ${config.system.build.etcBasedir} $out/etc-basedir
+      '';
+    })
+
+    (mkIf (cfg.fewerDerivations && overlay) {
+      system.build.etcActivationCommands = mkForce overlayActivationCommands;
+
+      # nixos-init's bootspec extension refers to /etc. Add those paths in the toplevel builder,
+      # so that boot.json's derivation doesn't depend on /etc.
+      boot.bootspec.extensions."org.nixos.nixos-init.v1" = {
+        etc_metadata_image = mkForce null;
+        etc_basedir = mkForce null;
+      };
+      boot.bootspec.writer = mkForce ''
+        ${options.boot.bootspec.writer.default}
+        ${lib.getExe pkgs.buildPackages.jq} --sort-keys \
+          --arg image ${config.system.build.etcMetadataImage} --arg basedir ${config.system.build.etcBasedir} \
+          '."org.nixos.nixos-init.v1" += { etc_metadata_image: $image, etc_basedir: $basedir }' \
+          $out/${config.boot.bootspec.filename} > bootspec.tmp
+        mv bootspec.tmp $out/${config.boot.bootspec.filename}
       '';
     })
 

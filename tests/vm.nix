@@ -17,6 +17,7 @@ testers.runNixOSTest {
         systemdUnits = true;
         buildEnv = true;
         fixDependencies = true;
+        fewerDerivations = true;
       };
       system.etc.overlay.enable = overlay;
       boot.initrd.systemd.enable = true;
@@ -54,6 +55,10 @@ testers.runNixOSTest {
     machine.succeed("grep -r /run/current-system/sw /etc/dbus-1/")
     # terminfo from systemPackages (foot) is found through /etc/terminfo
     machine.succeed("test -e /etc/terminfo/f/foot")
+
+    # Switching to the running system leaves /etc alone (the overlay isn't remounted)
+    out = machine.succeed("/run/current-system/bin/switch-to-configuration test 2>&1")
+    assert "remounting /etc" not in out, out
 
     # switch-to-configuration compares the new toplevel's etc with the running units
     before = machine.succeed("systemctl show -P InvocationID nbh-test.service")

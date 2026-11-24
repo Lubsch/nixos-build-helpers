@@ -1,7 +1,7 @@
 # Differential tests: build each output with nixpkgs' builder and with ours, and compare.
 #
 # `checks` is what `nix flake check` runs. `matrix` additionally covers every combination of
-# options on the featureful configuration (nix build .#tests.matrix).
+# options on the featureful configuration (nix build .#tests.matrix, 48 systems).
 { pkgs, nixpkgs }:
 let
   inherit (pkgs) lib;
@@ -13,6 +13,7 @@ let
     etcOverlay = false;
     systemdUnits = false;
     buildEnv = false;
+    fewerDerivations = false;
   };
   noOptions = builderOptions // {
     fixDependencies = false;
@@ -56,6 +57,7 @@ let
     c:
     let
       etc = c.environment.etc;
+      fewer = c.nixosBuildHelpers.fewerDerivations;
       units = {
         system-units = etc."systemd/system".source;
         user-units = etc."systemd/user".source;
@@ -66,7 +68,10 @@ let
     lib.filterAttrs (_: v: v.drv != null) (
       lib.mapAttrs (_: drv: {
         inherit drv;
-        inputs = [ "buildEnv" ];
+        inputs = [
+          "buildEnv"
+          "fewerDerivations"
+        ];
       }) units
       // {
         system-path = {
@@ -78,6 +83,7 @@ let
           inputs = [
             "systemdUnits"
             "buildEnv"
+            "fewerDerivations"
           ];
         };
         etc-metadata = {
@@ -85,19 +91,36 @@ let
           inputs = [
             "systemdUnits"
             "buildEnv"
+            "fewerDerivations"
           ];
         };
         # Everything else, e.g. the activation script and $out/etc, which switch-to-configuration reads
         toplevel = {
           drv = c.system.build.toplevel;
-          # contains nixos-build-helpers, for offline rebuilds
-          ignore = [ "extra-dependencies" ];
-          inputs = [
-            "etc"
-            "etcOverlay"
-            "systemdUnits"
-            "buildEnv"
+          # extra-dependencies contains nixos-build-helpers, for offline rebuilds. fewerDerivations
+          # adds links for the activation script to find /etc, which upstream has in the script.
+          ignore = [
+            "extra-dependencies"
+          ]
+          ++ lib.optionals fewer [
+            "etc-metadata-image"
+            "etc-basedir"
           ];
+          subst = lib.optionals fewer [
+            [
+              ''$(readlink -f "$systemConfig/etc")''
+              "/nix/store/<hash>-etc/etc"
+            ]
+            [
+              ''$(readlink -f "$systemConfig/etc-metadata-image")''
+              "/nix/store/<hash>-etc-metadata.erofs"
+            ]
+            [
+              ''$(readlink -f "$systemConfig/etc-basedir")''
+              "/nix/store/<hash>-etc-lowerdir"
+            ]
+          ];
+          inputs = lib.attrNames builderOptions;
         };
       }
     );
@@ -115,6 +138,7 @@ let
           drv,
           inputs,
           ignore ? [ ],
+          subst ? [ ],
         }:
         let
           normalize = lib.any (o: opts.${o}) inputs;
@@ -123,7 +147,11 @@ let
             ++ lib.concatMap (i: [
               "--ignore"
               i
-            ]) ignore;
+            ]) ignore
+            ++ lib.concatMap (fromTo: [
+              "--subst"
+              (lib.escapeShellArg (lib.concatStringsSep "=" fromTo))
+            ]) subst;
         in
         ''
           echo "== ${component}${lib.optionalString normalize " (store hashes normalized)"}"
@@ -155,6 +183,7 @@ let
       });
 
   all = {
+    fewerDerivations = true;
     systemdUnits = true;
     buildEnv = true;
     fixDependencies = true;
@@ -199,6 +228,8 @@ let
     featureful-systemdUnits = mkTest "featureful" false { systemdUnits = true; };
     featureful-buildEnv = mkTest "featureful" false { buildEnv = true; };
     featureful-fixDependencies = mkTest "featureful" false { fixDependencies = true; };
+    featureful-fewerDerivations = mkTest "featureful" false { fewerDerivations = true; };
+    featureful-overlay-fewerDerivations = mkTest "featureful" true { fewerDerivations = true; };
     featureful-all = mkTest "featureful" false (all // { etc = true; });
     featureful-overlay-all = mkTest "featureful" true (all // { etcOverlay = true; });
     minimal-all = mkTest "minimal" false (all // { etc = true; });
@@ -226,6 +257,7 @@ let
         systemdUnits = bools;
         buildEnv = bools;
         fixDependencies = bools;
+        fewerDerivations = bools;
       };
     in
     pkgs.linkFarm "test-matrix" (

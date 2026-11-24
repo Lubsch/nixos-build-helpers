@@ -153,9 +153,11 @@ def bench_buildenv(a, overlay: bool) -> list[dict]:
 
 def combos(overlay: bool) -> list[tuple[str, dict]]:
     etc = "etcOverlay" if overlay else "etc"
-    singles = [{etc: True}, {"systemdUnits": True}, {"buildEnv": True}, {"fixDependencies": True}]
-    every = all_builders(overlay) | {"fixDependencies": True}
-    return [("upstream", {}), ("previous", every)] + [("current", o) for o in singles + [every]]
+    singles = [{etc: True}, {"systemdUnits": True}, {"buildEnv": True}, {"fixDependencies": True},
+               {"fewerDerivations": True}]
+    previous = all_builders(overlay) | {"fixDependencies": True}
+    every = previous | {"fewerDerivations": True}
+    return [("upstream", {}), ("previous", previous)] + [("current", o) for o in singles + [every]]
 
 
 def combo_name(variant: str, options: dict) -> str:

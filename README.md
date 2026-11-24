@@ -11,6 +11,7 @@ reimplementation that produces **identical output** (checked by differential tes
 | `systemdUnits` | `system-units`, `user-units`, `initrd-units`, `nspawn-units` (`generateUnits`) | bash, several commands per unit |
 | `buildEnv` | `system.path` (`/run/current-system/sw`) | perl (`buildenv/builder.pl`) |
 | `fixDependencies` | — | see below |
+| `fewerDerivations` | — | see below |
 
 `fixDependencies` doesn't replace a builder but cuts the dependency of /etc on `system.path`:
 upstream, /etc links the dbus configuration and `/etc/terminfo` (and through dbus, the units)
@@ -19,6 +20,18 @@ before `system.path` is. With `fixDependencies`, they refer to `/run/current-sys
 which is the same `system.path` at run time. Use `nix run .#check-deps -- <installable>` to
 check that /etc of a system doesn't depend on `system.path` anymore (it walks the derivation
 graph and prints the chain if it does). Other modules can still add such dependencies.
+
+`fewerDerivations` removes derivations from the way between a change and the toplevel. Each
+level costs ~0.1 s, mostly nix's scheduling, even when the build itself takes milliseconds:
+- `environment.etc.<name>.text` that refers to no store paths is written at evaluation time
+  (`builtins.toFile`) instead of by a `writeText` derivation.
+- The activation script finds /etc (with the overlay: the metadata image and basedir) through
+  `$systemConfig` at run time, instead of having their store paths built in. The overlay
+  snippet is still upstream's, with only those paths replaced.
+- boot.json gets nixos-init's /etc paths added in the toplevel builder.
+
+So `activate` and `boot.json` no longer depend on /etc, and after editing a plain /etc file only
+/etc and the toplevel are built.
 
 ## Results
 
@@ -61,9 +74,9 @@ differences are, and what makes the current version faster: it creates ~1400 few
 
 | change | nixpkgs | all options | derivations built |
 |---|---|---|---|
-| edit a file in /etc | 2.2 s | 1.8 s | 8 → 5 |
-| add a package | 4.7 s | 2.7 s | 17 → 9 |
-| edit a service | 3.5 s | 2.0 s | 10 → 7 |
+| edit a file in /etc | 2.2 s | 1.6 s | 8 → 2 |
+| add a package | 4.8 s | 2.5 s | 17 → 7 |
+| edit a service | 3.6 s | 1.8 s | 10 → 5 |
 
 With iets as evaluator (eval ~0.9 s). With nix 2.34, eval takes ~5.5 s instead and dominates the
 total.
@@ -74,6 +87,8 @@ What the options achieve:
 - `fixDependencies` alone doesn't make rebuilds faster: a new package no longer rebuilds /etc
   and the units (17 → 12 derivations), but `system.path` still has to be built before the
   toplevel. Combined with the other options, it takes /etc off the critical path.
+- `fewerDerivations` saves ~0.1 s per level it removes (up to 3 for an /etc change). The
+  build itself after an /etc edit takes 0.3 s with `nix build`, 0.6 s with `iets build`.
 - `buildEnv` saves ~0.2 s per package change.
 - `buildEnv` and `fixDependencies` read upstream's values by evaluating the system a second time
   without our options (`extendModules`, sharing `pkgs`). That costs ~0.1 s of evaluation with
