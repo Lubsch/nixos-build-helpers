@@ -1,0 +1,107 @@
+--- a/src/update-mime-database.cpp
++++ b/src/update-mime-database.cpp
+@@ -104,6 +104,10 @@
+ 	 * with an unknown namespace.
+ 	 */
+ 	xmlDoc	*output;
++
++	/* The <comment> element in output for each xml:lang ("=" + lang, or
++	 * "" without xml:lang). There's at most one, see remove_old(). */
++	GHashTable *comments;
+ };
+ 
+ struct _Glob {
+@@ -219,6 +223,7 @@
+ 	g_free(type->subtype);
+ 
+ 	xmlFreeDoc(type->output);
++	g_hash_table_destroy(type->comments);
+ 
+ 	g_free(type);
+ }
+@@ -264,6 +269,7 @@
+ 	g_hash_table_insert(types, g_strdup(name), type);
+ 
+ 	type->output = xmlNewDoc((xmlChar *)"1.0");
++	type->comments = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+ 	root = xmlNewDocNode(type->output, NULL, (xmlChar *)"mime-type", NULL);
+ 	ns = xmlNewNs(root, FREE_NS, NULL);
+ 	xmlSetNs(root, ns);
+@@ -598,32 +604,12 @@
+ 	return !copy_to_xml;
+ }
+ 
+-/* Checks to see if 'node' has the given value for xml:lang.
+- * If 'lang' is NULL, checks that 'node' doesn't have an xml:lang.
+- */
+-static gboolean has_lang(xmlNode *node, const char *lang)
+-{
+-	char *lang2;
+-
+-	lang2 = my_xmlGetNsProp(node, "lang", XML_NS);
+-	if (!lang2)
+-		return !lang;
+-
+-	if (lang && strcmp(lang, lang2) == 0)
+-	{
+-		xmlFree(lang2);
+-		return TRUE;
+-	}
+-	xmlFree(lang2);
+-	return FALSE;
+-}
+-
+ /* We're about to add 'new' to the list of fields to be output for the
+  * type. Remove any existing nodes which it replaces.
+  */
+ static void remove_old(Type *type, xmlNode *newNode)
+ {
+-	xmlNode *field, *fields;
++	xmlNode *field;
+ 	char *lang;
+ 
+ 	if (newNode->ns == NULL || xmlStrcmp(newNode->ns->href, FREE_NS) != 0)
+@@ -634,17 +620,17 @@
+ 
+ 	lang = my_xmlGetNsProp(newNode, "lang", XML_NS);
+ 
+-	fields = xmlDocGetRootElement(type->output);
+-	for (field = fields->xmlChildrenNode; field; field = field->next)
+-	{
+-		if (match_node(field, (char *)FREE_NS, "comment") &&
+-		    has_lang(field, lang))
+-		{
+-			xmlUnlinkNode(field);
+-			xmlFreeNode(field);
+-			break;
+-		}
++	/* Instead of searching the output for a comment with this xml:lang,
++	 * which is quadratic in the number of translations. */
++	char *key = lang ? g_strconcat("=", lang, nullptr) : g_strdup("");
++	field = static_cast<xmlNode *>(g_hash_table_lookup(type->comments, key));
++	if (field)
++	{
++		g_hash_table_remove(type->comments, key);
++		xmlUnlinkNode(field);
++		xmlFreeNode(field);
+ 	}
++	g_free(key);
+ 
+ 	xmlFree(lang);
+ }
+@@ -699,6 +685,15 @@
+ 		remove_old(type, field);
+ 
+ 		xmlAddChild(xmlDocGetRootElement(type->output), copy);
++
++		if (field->ns && xmlStrcmp(field->ns->href, FREE_NS) == 0 &&
++		    strcmp((char *)field->name, "comment") == 0)
++		{
++			char *lang = my_xmlGetNsProp(field, "lang", XML_NS);
++			g_hash_table_replace(type->comments,
++				lang ? g_strconcat("=", lang, nullptr) : g_strdup(""), copy);
++			xmlFree(lang);
++		}
+ 	}
+ }
+ 
