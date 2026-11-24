@@ -23,6 +23,25 @@
       });
 
       apps = forAllSystems (pkgs: {
+        # nix run .#bench -- --help
+        bench = {
+          type = "app";
+          meta.description = "Benchmark nixos-build-helpers against nixpkgs";
+          program = toString (
+            pkgs.writeShellScript "bench" ''
+              # A pinned nix client, so that timings don't depend on what's installed
+              export PATH=${
+                pkgs.lib.makeBinPath [
+                  pkgs.nix
+                  pkgs.git
+                  pkgs.hyperfine
+                ]
+              }:$PATH
+              # Run from the checkout: it needs git history (--previous-rev) and writes results
+              exec ${pkgs.python3}/bin/python3 "$(git rev-parse --show-toplevel)/bench/bench.py" "$@"
+            ''
+          );
+        };
         # nix run .#check-deps -- <flake>#nixosConfigurations.<name>
         check-deps = {
           type = "app";

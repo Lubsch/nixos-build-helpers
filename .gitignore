@@ -1,6 +1,6 @@
 .direnv
 target/
-*json
-result*
+/result*
 profile.json*
 out
+__pycache__
