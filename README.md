@@ -40,6 +40,47 @@ So `activate` and `boot.json` no longer depend on /etc: after editing a plain /e
 /etc and the toplevel are built, and after editing a service, its script, the units, /etc and
 the toplevel.
 
+## Faster switches
+
+One more option makes `switch-to-configuration` (what a switch waits for after the build)
+faster. Unlike the options above, it changes behaviour, so it's tested by checking behaviour,
+not output:
+
+| option | replaces | saves per switch |
+|---|---|---|
+| `switchToConfiguration` | `switch-to-configuration` (patched, `patches/switch-to-configuration.patch`) | ~240 ms, ~140 ms more when systemd didn't change, ~70 ms more when nothing the user manager loads did |
+
+`switchToConfiguration`:
+- Upstream waits for systemd's events to settle by polling D-Bus every 250 ms, until an interval
+  without messages: every switch waits that interval at least once. The patch polls every 10 ms.
+  A unit failing within 10 ms after its start job finished is still reported; one failing
+  between 10 and 250 ms later isn't anymore (it shows up in `systemctl --failed`, of course).
+- Upstream reexecutes every user manager on every switch (~140 ms). The patch reexecutes it only
+  when it would run another binary or `etc/systemd/user.conf` changed, like upstream does for
+  PID 1. The binary it runs is the one of the process in `user@<uid>.service`'s init.scope (cgroup
+  v2), looked up by the root parent: the user may not read `/proc/<pid>/exe` of its own manager
+  (the kernel's ptrace check also compares capabilities). If it can't be found, it reexecutes as
+  before.
+- Upstream reloads every user manager (~70 ms). The patch reloads only after a reexecution, or
+  when something a reload reads changed with the toplevel: every directory of the manager's unit
+  search path (`UnitPath`, as the manager reports it) below `/run/current-system` or `/etc`, i.e.
+  `/etc/systemd/user` but also units of packages in `/run/current-system/sw/{share,etc/xdg}/systemd/user`
+  and `/etc/profiles/per-user/<user>`, plus the generators (`/etc/systemd/user-generators`,
+  `user-environment-generators`), presets, and what systemd's own generators read
+  (`/etc/environment.d`, the xdg autostart directories of the manager's `XDG_CONFIG_DIRS`). They're
+  compared between the old and the new toplevel by content, not by path: with the /etc overlay,
+  some are directories of each generation's /etc. If the manager's search path can't be read, it
+  reloads. Not covered, since no switch changes them: units edited in `~/.config/systemd/user`
+  (or other profiles) without `systemctl --user daemon-reload`, which a switch used to pick up.
+  Generators added through NixOS that read other files would need to be listed here.
+- What a switch does to bring units to the configured state doesn't depend on either: it's planned
+  from the active units and the old and new unit files before the reexecution and reload
+  (restarting changed units, starting active targets again, which starts what they want that was
+  stopped by hand or failed, after `reset-failed`), and that's unchanged.
+- The wrapper (`bin/switch-to-configuration`, which sets the environment) stays upstream's; the
+  program it runs is swapped in the toplevel's builder. The build fails if the wrapper isn't
+  made as before, and if the patch doesn't apply to a new nixpkgs.
+
 ## Results
 
 Measured on the `desktop` configuration (`bench/configs/desktop.nix`, 192 packages,
@@ -156,6 +197,9 @@ argument), so a nixpkgs update fails loudly instead of building something differ
   builder). Review the upstream change, port it with a test, update the hash.
 - **VM tests** boot a system with all options, with and without the overlay, and switch to a
   changed configuration (units must be restarted, /etc updated).
+  With `switchToConfiguration`, a user manager (a lingering user) must neither be reexecuted nor
+  reloaded by a switch that changes only system units, and reloaded by one changing a user unit
+  or only adding a package with a user unit (which it must know afterwards).
 
 ## Benchmarks
 

@@ -30,10 +30,26 @@ let
         wantedBy = [ "default.target" ];
         script = "true";
       };
+      # A user manager for switch-to-configuration's user scope
+      users.users.alice = {
+        isNormalUser = true;
+        linger = true;
+      };
       # A system to switch to, changing a unit and a file in /etc
       specialisation.changed.configuration = {
         systemd.services.nbh-test.environment.CHANGED = "1";
         environment.etc."nbh-test".text = pkgs.lib.mkForce "changed";
+      };
+      # Changing a user unit
+      specialisation.userChanged.configuration = {
+        systemd.user.services.nbh-test-user.environment.CHANGED = "1";
+      };
+      # The same, plus a package with a user unit (in /run/current-system/sw, not /etc)
+      specialisation.packageChanged.configuration = {
+        systemd.user.services.nbh-test-user.environment.CHANGED = "1";
+        environment.systemPackages = [
+          (pkgs.writeTextDir "share/systemd/user/nbh-test-package.service" "[Service]\nExecStart=${pkgs.coreutils}/bin/true\n")
+        ];
       };
     };
 in
@@ -51,6 +67,7 @@ testers.runNixOSTest {
       buildEnv = true;
       fixDependencies = true;
       fewerDerivations = true;
+      switchToConfiguration = true;
     };
   };
   # The same system without nixos-build-helpers
@@ -86,9 +103,40 @@ testers.runNixOSTest {
     assert "remounting /etc" not in out, out
 
     # switch-to-configuration compares the new toplevel's etc with the running units
+    machine.wait_for_unit("user@1000.service")
+    base = machine.succeed("readlink -f /run/current-system").strip()
+    cursor = machine.succeed("journalctl --show-cursor -n0 -q | sed -n 's/^-- cursor: //p'").strip()
     before = machine.succeed("systemctl show -P InvocationID nbh-test.service")
-    machine.succeed("/run/current-system/specialisation/changed/bin/switch-to-configuration test")
+    machine.succeed(f"{base}/specialisation/changed/bin/switch-to-configuration test")
     assert machine.succeed("systemctl show -P InvocationID nbh-test.service") != before, "nbh-test wasn't restarted"
     assert machine.succeed("cat /etc/nbh-test") == "changed"
+
+    # switchToConfiguration: the user manager runs the same systemd and user units: neither
+    # reexecuted nor reloaded. (The system manager is reloaded: a system unit changed.)
+    def user_manager_log(since):
+        return machine.succeed(f"journalctl --after-cursor='{since}' _SYSTEMD_UNIT=user@1000.service -o cat")
+    log = user_manager_log(cursor)
+    assert "Reexecuting" not in log and "Reloading" not in log, log
+    assert "Reloading finished" in machine.succeed(f"journalctl --after-cursor='{cursor}' _PID=1 -o cat")
+
+    # A changed user unit: the user manager is reloaded, still not reexecuted
+    cursor = machine.succeed("journalctl --show-cursor -n0 -q | sed -n 's/^-- cursor: //p'").strip()
+    machine.succeed(f"{base}/specialisation/userChanged/bin/switch-to-configuration test")
+    log = user_manager_log(cursor)
+    assert "Reloading finished" in log and "Reexecuting" not in log, log
+
+    # Only a package's user unit is new (the user units in /etc are the same): reloaded too, so
+    # that the user manager knows it
+    for p in ["etc/systemd/user", "etc/environment.d"]:
+        assert machine.succeed(f"readlink -f {base}/specialisation/userChanged/{p}") == machine.succeed(f"readlink -f {base}/specialisation/packageChanged/{p}"), p
+    user = "systemctl --machine=alice@ --user"
+    def load_state(unit):
+        return machine.succeed(f"{user} show -P LoadState {unit}").strip()
+    assert load_state("nbh-test-package.service") == "not-found"
+    cursor = machine.succeed("journalctl --show-cursor -n0 -q | sed -n 's/^-- cursor: //p'").strip()
+    machine.succeed(f"{base}/specialisation/packageChanged/bin/switch-to-configuration test")
+    log = user_manager_log(cursor)
+    assert "Reloading finished" in log and "Reexecuting" not in log, log
+    assert load_state("nbh-test-package.service") == "loaded"
   '';
 }

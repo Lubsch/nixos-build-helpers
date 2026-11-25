@@ -1,0 +1,206 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1324,6 +1324,129 @@
+ }
+ 
+ /// Performs switch-to-configuration functionality for a single non-root user
++/// The binary a user manager runs, looked up by the parent for the child.
++const USER_MANAGER_EXE_ENV: &str = "__NIXOS_SWITCH_TO_CONFIGURATION_USER_MANAGER_EXE";
++
++/// Whether the old and the new version of a path have other contents. Missing in both counts as
++/// unchanged, missing in one as changed.
++fn differs(old: &Path, new: &Path) -> bool {
++    match (old.canonicalize(), new.canonicalize()) {
++        (Ok(old), Ok(new)) => !same_contents(&old, &new, 0),
++        (Err(_), Err(_)) => false,
++        _ => true,
++    }
++}
++
++/// A path the switch changes, in the old and the new toplevel: everything below
++/// /run/current-system and /etc. Other paths (home directories, /run/user, other profiles, the
++/// systemd package's own directories) don't change with the toplevel.
++fn in_toplevels(old_toplevel: &Path, toplevel: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> {
++    if let Ok(rest) = path.strip_prefix("/run/current-system") {
++        Some((old_toplevel.join(rest), toplevel.join(rest)))
++    } else if let Ok(rest) = path.strip_prefix("/etc") {
++        Some((old_toplevel.join("etc").join(rest), toplevel.join("etc").join(rest)))
++    } else {
++        None
++    }
++}
++
++/// Whether anything a daemon-reload of the user manager reads changed with the toplevel: the
++/// directories of its unit search path (as the manager reports it: /etc/systemd/user, but also
++/// packages' units in /run/current-system/sw and /etc/profiles/per-user), the generators, and what
++/// systemd's own generators read (environment.d, xdg autostart). On doubt: changed.
++fn user_manager_inputs_changed(
++    systemd: &Proxy<'_, &LocalConnection>,
++    old_toplevel: &Path,
++    toplevel: &Path,
++) -> bool {
++    let (unit_path, environment) = match (systemd.unit_path(), systemd.environment()) {
++        (Ok(unit_path), Ok(environment)) => (unit_path, environment),
++        (Err(err), _) | (_, Err(err)) => {
++            log::debug!("Failed to read the user manager's search paths, reloading: {err}");
++            return true;
++        }
++    };
++    let config_dirs = environment
++        .iter()
++        .find_map(|kv| kv.strip_prefix("XDG_CONFIG_DIRS="))
++        .unwrap_or("/etc/xdg")
++        .split(':')
++        .filter(|dir| !dir.is_empty())
++        .map(|dir| Path::new(dir).join("autostart"));
++    let paths: Vec<PathBuf> = unit_path
++        .iter()
++        .map(PathBuf::from)
++        .chain(
++            [
++                "/etc/systemd/user-generators",
++                "/etc/systemd/user-environment-generators",
++                "/etc/systemd/user-preset",
++                "/etc/environment.d",
++            ]
++            .map(PathBuf::from),
++        )
++        .chain(config_dirs)
++        .collect();
++    paths.iter().any(|path| {
++        in_toplevels(old_toplevel, toplevel, path).is_some_and(|(old, new)| {
++            let changed = differs(&old, &new);
++            if changed {
++                log::debug!("{} changed, reloading the user manager", path.display());
++            }
++            changed
++        })
++    })
++}
++
++/// Whether two canonical paths have the same contents: files by their bytes, directories (e.g. in
++/// /etc, which is rebuilt with every change of it) entry by entry, following symlinks.
++fn same_contents(a: &Path, b: &Path, depth: usize) -> bool {
++    if a == b {
++        return true;
++    }
++    let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
++        return false;
++    };
++    if meta_a.is_file() && meta_b.is_file() {
++        return meta_a.len() == meta_b.len()
++            && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y);
++    }
++    if !(meta_a.is_dir() && meta_b.is_dir()) || depth > 8 {
++        return false;
++    }
++    let names = |dir: &Path| -> Option<Vec<std::ffi::OsString>> {
++        let mut names = std::fs::read_dir(dir)
++            .ok()?
++            .map(|e| e.map(|e| e.file_name()))
++            .collect::<std::io::Result<Vec<_>>>()
++            .ok()?;
++        names.sort();
++        Some(names)
++    };
++    match (names(a), names(b)) {
++        (Some(names_a), Some(names_b)) if names_a == names_b => names_a.iter().all(|name| {
++            match (a.join(name).canonicalize(), b.join(name).canonicalize()) {
++                (Ok(x), Ok(y)) => same_contents(&x, &y, depth + 1),
++                _ => false,
++            }
++        }),
++        _ => false,
++    }
++}
++
++/// The binary the user manager of `uid` runs: the process in its unit's init.scope (cgroup v2).
++/// Read as root: the user itself may not be allowed to read /proc/<pid>/exe of its manager.
++fn user_manager_exe(uid: u32) -> Option<PathBuf> {
++    let procs = std::fs::read_to_string(format!(
++        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/init.scope/cgroup.procs"
++    ))
++    .ok()?;
++    procs
++        .lines()
++        .filter_map(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).ok())
++        .find(|exe| exe.ends_with("lib/systemd/systemd"))
++}
++
+ fn do_user_switch(parent_exe: String) -> anyhow::Result<()> {
+     if Path::new(&parent_exe)
+         != Path::new("/proc/self/exe")
+@@ -1535,13 +1658,34 @@
+         print_units("NOT restarting", &units_to_skip);
+     }
+ 
+-    // The systemd user session seems to not send a Reloaded signal, so we don't have anything to
+-    // wait on here.
+-    _ = systemd.reexecute();
++    // Reexecute only when the user manager would run another binary or configuration, like the
++    // system scope does for pid 1: a reexecution takes ~140 ms. The parent looked up the binary it
++    // runs (as root: the user can't always read /proc/<pid>/exe of it); without it, reexecute.
++    let running_systemd = std::env::var_os(USER_MANAGER_EXE_ENV).map(PathBuf::from);
++    let new_systemd = toplevel.join("systemd/lib/systemd/systemd").canonicalize().ok();
++    let user_conf_changed = differs(
++        &old_toplevel.join("etc/systemd/user.conf"),
++        &toplevel.join("etc/systemd/user.conf"),
++    );
++    let reexecute = new_systemd.is_none() || running_systemd != new_systemd || user_conf_changed;
++    log::debug!(
++        "user manager runs {running_systemd:?}, new {new_systemd:?}, user.conf changed: {user_conf_changed}"
++    );
++    if reexecute {
++        // The systemd user session seems to not send a Reloaded signal, so we don't have anything
++        // to wait on here.
++        _ = systemd.reexecute();
++    }
+ 
+-    // Reset failed and reload so that subsequent starts use the new unit files.
++    // Reset failed and reload so that subsequent starts use the new unit files. Not needed when
++    // nothing a reload reads changed with the toplevel (~70 ms).
+     _ = systemd.reset_failed();
+-    _ = systemd.reload();
++    let reload = reexecute || user_manager_inputs_changed(&systemd, &old_toplevel, &toplevel);
++    if reload {
++        _ = systemd.reload();
++    } else {
++        log::debug!("user units unchanged, not reloading the user manager");
++    }
+ 
+     print_units("reloading", &units_to_reload);
+     for unit in units_to_reload.keys() {
+@@ -2419,7 +2563,8 @@
+                     .context("Failed to get full path to /proc/self/exe")?;
+ 
+                 log::debug!("Performing user switch for {name}");
+-                let status = std::process::Command::new(&myself)
++                let mut child = std::process::Command::new(&myself);
++                child
+                     .uid(uid)
+                     .gid(metadata.gid())
+                     .env_clear()
+@@ -2427,7 +2572,11 @@
+                     .env("__NIXOS_SWITCH_TO_CONFIGURATION_PARENT_EXE", &myself)
+                     .env("TOPLEVEL", &toplevel)
+                     .env("OLD_TOPLEVEL", &old_toplevel)
+-                    .env("NIXOS_ACTION", Into::<&'static str>::into(action))
++                    .env("NIXOS_ACTION", Into::<&'static str>::into(action));
++                if let Some(exe) = user_manager_exe(uid) {
++                    child.env(USER_MANAGER_EXE_ENV, exe);
++                }
++                let status = child
+                     .spawn()
+                     .with_context(|| format!("Failed to spawn user activation for {name}"))?
+                     .wait()
+@@ -2608,7 +2757,9 @@
+     // Wait for events from systemd to settle. process() will return true if we have received any
+     // messages on the bus.
+     let mut waited = Duration::from_millis(0);
+-    let wait_interval = Duration::from_millis(250);
++    // 250 ms upstream, which every switch waited at least once: the loop ends with an interval
++    // without messages.
++    let wait_interval = Duration::from_millis(10);
+     let max_wait = Duration::from_secs(90);
+     log::debug!("waiting for systemd events to settle");
+     while dbus_conn.process(wait_interval).unwrap_or_default() {

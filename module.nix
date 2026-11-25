@@ -191,6 +191,12 @@ let
   # (Not if it mentions store paths without context: a derivation would find those references.)
   isPlainText = text: !builtins.hasContext text && !lib.hasInfix builtins.storeDir text;
 
+  # switch-to-configuration with ./patches/switch-to-configuration.patch (see the README).
+  upstreamSwitchToConfiguration = lib.getExe pkgs.switch-to-configuration-ng;
+  switchToConfiguration = pkgs.switch-to-configuration-ng.overrideAttrs (old: {
+    patches = old.patches or [ ] ++ [ ./patches/switch-to-configuration.patch ];
+  });
+
   # The shape of upstream's build command for buildEnv, which we replace.
   upstreamBuildEnvCommand = builtins.unsafeDiscardStringContext "${pkgs.buildPackages.perl}/bin/perl -w ${builtins.storeDir}/[a-z0-9]{32}-builder.pl\neval \"\\$postBuild\"\n";
 in
@@ -201,6 +207,7 @@ in
     systemdUnits = mkEnableOption "the faster builder for systemd units (system-units, user-units, initrd-units, nspawn-units)";
     buildEnv = mkEnableOption "the faster builder for `system.path`";
     fixDependencies = mkEnableOption "removing the dependency of /etc on `system.path`, so they build in parallel and /etc isn't rebuilt when only packages change";
+    switchToConfiguration = mkEnableOption "a patched `switch-to-configuration` that waits less: 10 ms instead of 250 ms for systemd's events to settle, and the user managers are only reexecuted when their systemd or user.conf changes, and only reloaded when something on their unit search path, their generators or what those read changed with the toplevel. Unlike the other options, this changes behaviour (see the README)";
     fewerDerivations = mkEnableOption "fewer derivations on the way from a change to the toplevel: `environment.etc.*.text` that refers to no store paths is written at evaluation time (`builtins.toFile`), the activation script and boot.json don't depend on /etc, and with `systemdUnits`, units are written by the units' derivation instead of one derivation each";
   };
 
@@ -314,6 +321,20 @@ in
         map (p: if isSystemPath p then "/run/current-system/sw" else p) upstream.services.dbus.packages
       );
       environment.etc.terminfo.source = mkForce "/run/current-system/sw/share/terminfo";
+    })
+
+    (mkIf (cfg.switchToConfiguration && config.system.switch.enable) {
+      # Upstream's wrapper, which sets the environment, with the program it wraps replaced.
+      # Replacing the program in upstream's builder commands would need them from the system
+      # without our options, whose activation script is another one with fewerDerivations.
+      system.activatableSystemBuilderCommands = lib.mkAfter ''
+        wrapped=$out/bin/.switch-to-configuration-wrapped
+        if [[ $(readlink "$wrapped") != ${upstreamSwitchToConfiguration} ]]; then
+          echo "nixosBuildHelpers.switchToConfiguration: switch-to-configuration isn't wrapped as before. nixos-build-helpers needs an update." >&2
+          exit 1
+        fi
+        ln -sfn ${lib.getExe switchToConfiguration} "$wrapped"
+      '';
     })
 
     {
