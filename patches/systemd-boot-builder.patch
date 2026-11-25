@@ -1,0 +1,141 @@
+--- a/systemd-boot-builder.py
++++ b/systemd-boot-builder.py
+@@ -432,25 +432,23 @@
+ 
+ 
+ def get_generations(profile: str | None = None) -> list[SystemIdentifier]:
+-    gen_list = run(
+-        [
+-            f"{NIX}/bin/nix-env",
+-            "--list-generations",
+-            "-p",
+-            "/nix/var/nix/profiles/%s"
+-            % ("system-profiles/" + profile if profile else "system"),
+-        ],
+-        stdout=subprocess.PIPE,
+-    ).stdout
+-    gen_lines = gen_list.split("\n")
+-    gen_lines.pop()
++    # nixos-build-helpers: the profile's generation links, as `nix-env --list-generations`
++    # lists them, without starting nix-env (~20 ms, and it takes the profile's lock).
++    profile_path = Path(
++        "/nix/var/nix/profiles/%s"
++        % ("system-profiles/" + profile if profile else "system")
++    )
++    link = re.compile(rf"{re.escape(profile_path.name)}-([0-9]+)-link")
++    generations = sorted(
++        int(m.group(1))
++        for e in os.scandir(profile_path.parent)
++        if (m := link.fullmatch(e.name)) is not None
++    )
+ 
+     configurationLimit = CONFIGURATION_LIMIT
+     configurations = [
+-        SystemIdentifier(
+-            profile=profile, generation=int(line.split()[0]), specialisation=None
+-        )
+-        for line in gen_lines
++        SystemIdentifier(profile=profile, generation=generation, specialisation=None)
++        for generation in generations
+     ]
+     return configurations[-configurationLimit:]
+ 
+@@ -519,21 +517,35 @@
+             params["touchVariables"] = False
+         if GRACEFUL:
+             params["graceful"] = True
+-        reply = bootctl_varlink_call("io.systemd.BootControl.Install", params)
+-
+-        error = reply.get("error")
+-        if error is not None:
+-            error_params = reply.get("parameters") or {}
+-            if (
+-                error == "io.systemd.System"
+-                and error_params.get("errno") == errno.ESTALE
+-            ):
+-                # Same or newer boot loader version already in place.
+-                pass
+-            else:
+-                raise RuntimeError(
+-                    f"bootctl update failed: {error} {json.dumps(error_params)}"
+-                )
++        # nixos-build-helpers: bootctl compares the installed boot loader with the one of its own
++        # systemd package. If that package already updated it (or found it current), it would
++        # only find it current again: don't start it (~30 ms). Recorded on the ESP itself, so a
++        # new or restored ESP gets the update.
++        marker = EFI_SYS_MOUNT_POINT / "loader" / ".nixos-bootctl-update"
++        try:
++            up_to_date = marker.read_text() == f"{SYSTEMD}\n"
++        except OSError:
++            up_to_date = False
++        if not up_to_date:
++            reply = bootctl_varlink_call("io.systemd.BootControl.Install", params)
++
++            error = reply.get("error")
++            if error is not None:
++                error_params = reply.get("parameters") or {}
++                if (
++                    error == "io.systemd.System"
++                    and error_params.get("errno") == errno.ESTALE
++                ):
++                    # Same or newer boot loader version already in place.
++                    pass
++                else:
++                    raise RuntimeError(
++                        f"bootctl update failed: {error} {json.dumps(error_params)}"
++                    )
++            marker.parent.mkdir(parents=True, exist_ok=True)
++            tmp = marker.with_suffix(".tmp")
++            tmp.write_text(f"{SYSTEMD}\n")
++            os.rename(tmp, marker)
+ 
+     (BOOT_MOUNT_POINT / NIXOS_DIR).mkdir(parents=True, exist_ok=True)
+     (BOOT_MOUNT_POINT / "loader/entries").mkdir(parents=True, exist_ok=True)
+@@ -593,7 +605,9 @@
+     write_loader_conf(default_entry_id)
+ 
+     remove_extra_files()
+-    run([COPY_EXTRA_FILES])
++    # nixos-build-helpers: a script of only its shebang (no extraFiles) isn't started.
++    if any(line.strip() for line in Path(COPY_EXTRA_FILES).read_text().splitlines()[1:]):
++        run([COPY_EXTRA_FILES])
+ 
+     if BOOT_MOUNT_POINT != EFI_SYS_MOUNT_POINT:
+         # Cleanup any entries in ESP if xbootldrMountPoint is set.
+@@ -649,6 +663,27 @@
+         )
+ 
+ 
++def check_mountpoints() -> None:
++    # nixos-build-helpers: what check-mountpoints does (`findmnt <path>` for both), from the
++    # mount table, without starting bash and findmnt.
++    with open("/proc/self/mountinfo") as f:
++        # The fifth field, with spaces etc. escaped as octal.
++        targets = {
++            re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), line.split()[4])
++            for line in f
++        }
++    for name, path in [
++        ("efiSysMountPoint", EFI_SYS_MOUNT_POINT),
++        ("xbootldrMountPoint", BOOT_MOUNT_POINT),
++    ]:
++        if str(path) not in targets:
++            print(
++                f"{name} = '{path}' is not a mounted partition. Is the path configured correctly?",
++                file=sys.stderr,
++            )
++            sys.exit(1)
++
++
+ def main() -> None:
+     parser = argparse.ArgumentParser(
+         description=f"Update {DISTRO_NAME}-related systemd-boot files"
+@@ -660,7 +695,7 @@
+     )
+     args = parser.parse_args()
+ 
+-    run([CHECK_MOUNTPOINTS])
++    check_mountpoints()
+ 
+     try:
+         install_bootloader(args)

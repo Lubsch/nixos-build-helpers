@@ -247,6 +247,7 @@ let
     upstream = pkgs.callPackage ./upstream.nix { };
     vm = pkgs.callPackage ./vm.nix { overlay = false; };
     vm-overlay = pkgs.callPackage ./vm.nix { overlay = true; };
+    systemd-boot = pkgs.callPackage ./systemd-boot.nix { };
   };
 
   # Every combination of options (etc and etcOverlay are exclusive).

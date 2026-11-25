@@ -197,6 +197,47 @@ let
     patches = old.patches or [ ] ++ [ ./patches/switch-to-configuration.patch ];
   });
 
+  # Upstream's systemd-boot installer with ./patches/systemd-boot-builder.patch applied to its
+  # builder (see the README). The builder is the template with this system's values filled in, so
+  # it's patched at build time, where upstream's installer names it: the patch's context has none
+  # of those values. Run byte-compiled, without `site` (stdlib only), from a second output.
+  systemdBootInstaller = pkgs.runCommand "install-systemd-boot.sh" {
+    preferLocalBuild = true;
+    allowSubstitutes = false;
+    outputs = [
+      "out"
+      "lib"
+    ];
+    upstreamInstaller = upstream.system.build.installBootLoader;
+    nativeBuildInputs = [ pkgs.buildPackages.patch ];
+  } ''
+    fail() {
+      echo "nixosBuildHelpers.systemdBoot: $1. nixos-build-helpers needs an update." >&2
+      exit 1
+    }
+    upstreamBuilder=$(grep -o '${builtins.storeDir}/[a-z0-9]*-systemd-boot/bin/systemd-boot' "$upstreamInstaller") \
+      || fail "upstream's installer doesn't run a systemd-boot builder"
+    python=$(sed -n '1s|^#! *\(${builtins.storeDir}/[^ ]*/bin/python3[^ ]*\) -B$|\1|p' "$upstreamBuilder")
+    [[ -n $python ]] || fail "the builder's interpreter line changed"
+
+    cp "$upstreamBuilder" systemd-boot-builder.py
+    chmod u+w systemd-boot-builder.py
+    patch -p1 --forward --no-backup-if-mismatch < ${./patches/systemd-boot-builder.patch} \
+      || fail "the patch doesn't apply to the builder"
+
+    mkdir "$lib"
+    if "$python" -c pass 2>/dev/null; then
+      "$python" -c 'import py_compile, sys; py_compile.compile("systemd-boot-builder.py", cfile=sys.argv[1], doraise=True, invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)' "$lib/systemd-boot.pyc"
+      run="$python -BS $lib/systemd-boot.pyc"
+    else # cross-compiled: the host's python can't run here
+      cp systemd-boot-builder.py "$lib/systemd-boot.py"
+      run="$python -BS $lib/systemd-boot.py"
+    fi
+    grep -q "^$upstreamBuilder \"\$@\"$" "$upstreamInstaller" || fail "upstream's installer runs its builder differently"
+    sed "s|^$upstreamBuilder \"\$@\"$|$run \"\$@\"|" "$upstreamInstaller" > "$out"
+    chmod +x "$out"
+  '';
+
   # The shape of upstream's build command for buildEnv, which we replace.
   upstreamBuildEnvCommand = builtins.unsafeDiscardStringContext "${pkgs.buildPackages.perl}/bin/perl -w ${builtins.storeDir}/[a-z0-9]{32}-builder.pl\neval \"\\$postBuild\"\n";
 in
@@ -208,6 +249,7 @@ in
     buildEnv = mkEnableOption "the faster builder for `system.path`";
     fixDependencies = mkEnableOption "removing the dependency of /etc on `system.path`, so they build in parallel and /etc isn't rebuilt when only packages change";
     switchToConfiguration = mkEnableOption "a patched `switch-to-configuration` that waits less: 10 ms instead of 250 ms for systemd's events to settle, and the user managers are only reexecuted when their systemd or user.conf changes, and only reloaded when something on their unit search path, their generators or what those read changed with the toplevel. Unlike the other options, this changes behaviour (see the README)";
+    systemdBoot = mkEnableOption "a patched systemd-boot installer that starts fewer processes (no nix-env, check-mountpoints or an empty copy-extra-files script; bootctl only when the systemd package changes) and runs byte-compiled. Unlike the other options, this changes behaviour (see the README)";
     fewerDerivations = mkEnableOption "fewer derivations on the way from a change to the toplevel: `environment.etc.*.text` that refers to no store paths is written at evaluation time (`builtins.toFile`), the activation script and boot.json don't depend on /etc, and with `systemdUnits`, units are written by the units' derivation instead of one derivation each";
   };
 
@@ -335,6 +377,12 @@ in
         fi
         ln -sfn ${lib.getExe switchToConfiguration} "$wrapped"
       '';
+    })
+
+    (mkIf (cfg.systemdBoot && config.boot.loader.systemd-boot.enable) {
+      system.build.installBootLoader = mkForce systemdBootInstaller;
+      # For the VM test, which compares what both write to the ESP.
+      system.build.upstreamInstallBootLoader = upstream.system.build.installBootLoader;
     })
 
     {

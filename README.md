@@ -42,13 +42,14 @@ the toplevel.
 
 ## Faster switches
 
-One more option makes `switch-to-configuration` (what a switch waits for after the build)
-faster. Unlike the options above, it changes behaviour, so it's tested by checking behaviour,
-not output:
+Two more options make `switch-to-configuration` (what a switch waits for after the build)
+faster. Unlike the options above, they change behaviour, so they're tested by checking
+behaviour, not output:
 
 | option | replaces | saves per switch |
 |---|---|---|
 | `switchToConfiguration` | `switch-to-configuration` (patched, `patches/switch-to-configuration.patch`) | ~240 ms, ~140 ms more when systemd didn't change, ~70 ms more when nothing the user manager loads did |
+| `systemdBoot` | systemd-boot's installer (patched builder, `patches/systemd-boot-builder.patch`) | ~30 ms (one third of the installer), more on a real ESP |
 
 `switchToConfiguration`:
 - Upstream waits for systemd's events to settle by polling D-Bus every 250 ms, until an interval
@@ -80,6 +81,62 @@ not output:
 - The wrapper (`bin/switch-to-configuration`, which sets the environment) stays upstream's; the
   program it runs is swapped in the toplevel's builder. The build fails if the wrapper isn't
   made as before, and if the patch doesn't apply to a new nixpkgs.
+
+`systemdBoot` (only with `boot.loader.systemd-boot.enable`): upstream's builder is patched where
+upstream's installer names it, at build time (it's the template with the system's values filled
+in, which the patch's context doesn't contain), and run byte-compiled without `site` (stdlib only):
+- `nix-env --list-generations` (~20 ms, and the profile's lock) is replaced by listing the
+  profile's `<profile>-<n>-link`s.
+- `check-mountpoints` (bash and `findmnt`) is replaced by the same check against
+  `/proc/self/mountinfo`.
+- `copy-extra-files` isn't started when it's only its interpreter line (no `extraFiles`).
+- `bootctl update` (over Varlink) only runs when the systemd package changed since it last ran.
+  That's recorded on the ESP (`loader/.nixos-bootctl-update`), so a new or restored ESP is
+  updated. It's what bootctl would find anyway: its own boot loader, same version. Not covered:
+  someone replacing the boot loader on the ESP by hand, which `bootctl update` would have undone
+  only if it was older.
+- Not patched: the entries, kernels and initrds it writes, the garbage collection, `syncfs`.
+
+Measured in an unprivileged user and mount namespace, with a tmpfs as the ESP and this machine's 10
+generations, after a first install (hyperfine, 30 runs):
+
+| installer | wall time |
+|---|---|
+| upstream | 93.7 ms ± 4.1 |
+| patched, run as source | 67.7 ms ± 5.7 |
+| patched, byte-compiled, `-S` | 61.9 ms ± 5.0 |
+
+On a real ESP (vfat, fsync) and with a real `bootctl`, upstream's installer took ~185 ms in
+switches; the patched one saves the starts of bootctl, nix-env, bash and findmnt there too.
+`tests/systemd-boot.nix` checks that both write the same ESP, byte for byte.
+
+### Future: a rewrite of the systemd-boot installer
+
+What's left (~60 ms in the namespace) is mostly Python itself: starting it and importing the
+modules it needs (argparse, dataclasses, subprocess, …) takes ~50 ms. A rewrite in Rust, as one
+more subcommand of `nixos-build-helpers` (so nothing new is built per system), would bring it to
+a few milliseconds plus the unavoidable I/O. Notes for it:
+- Inputs: the same values upstream's template gets (pass them as arguments or a JSON file at
+  build time, like the other builders get `__structuredAttrs`): ESP and XBOOTLDR mount points,
+  timeout, editor, console mode, distro name, configuration limit, reboot-for-bitlocker,
+  `canTouchEfiVariables`, graceful, boot counting (tries), the extra-files script, systemd's path.
+- What it does, in upstream's order (keep it: entries are written after their kernel/initrd, the
+  loader.conf after the entries): check the mount points; `bootctl install` (with
+  `NIXOS_INSTALL_BOOTLOADER=1`) or `update` over Varlink (ESTALE = current); list generations of
+  `system` and every profile in `system-profiles/`, limited to the configuration limit; read each
+  `boot.json` (and specialisations); compute the entry files (their names are the SHA-256 of their
+  content, with boot counting suffixes `+<tries>[-<done>]` preserved for existing ones); copy
+  kernels/initrds/devicetrees that aren't there yet (temp file, fsync, rename); initrd secrets
+  (always rebuilt, from the pristine initrd, failure fatal only for the default generation);
+  garbage-collect everything else in `EFI/nixos` and `loader/entries/nixos-*.conf`; write
+  `loader.conf` (with `preferred` for boot counting); the extra files' bookkeeping in
+  `EFI/nixos/.extra-files`; `syncfs` both mounts, also on failure.
+- Upstream's builder is mypy-checked and has its own NixOS tests (`nixosTests.systemd-boot`):
+  run those against the rewrite, plus `tests/systemd-boot.nix` (same ESP as upstream, byte for
+  byte), and add `systemd-boot-builder.py` to `tests/upstream.nix` so that every upstream change
+  is reviewed.
+- Copying a new initrd (40+ MB on vfat, with fsync) dominates a switch that changes it; that's
+  I/O either way.
 
 ## Results
 
@@ -200,6 +257,9 @@ argument), so a nixpkgs update fails loudly instead of building something differ
   With `switchToConfiguration`, a user manager (a lingering user) must neither be reexecuted nor
   reloaded by a switch that changes only system units, and reloaded by one changing a user unit
   or only adding a package with a user unit (which it must know afterwards).
+  `tests/systemd-boot.nix` installs systemd-boot to an extra disk with upstream's installer and
+  ours and compares the ESPs, checks that bootctl is skipped only with the marker, and that an
+  unmounted ESP still fails.
 
 ## Benchmarks
 
