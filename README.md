@@ -78,6 +78,13 @@ behaviour, not output:
   from the active units and the old and new unit files before the reexecution and reload
   (restarting changed units, starting active targets again, which starts what they want that was
   stopped by hand or failed, after `reset-failed`), and that's unchanged.
+- Upstream asks systemd for the `FragmentPath` of every active unit, one D-Bus call after the
+  other, to skip units not loaded from the NixOS unit directory: ~30 ms for ~200 active units, the
+  longest part of planning a switch (measured as the gap between the boot loader and the
+  activation script). The patch sends all the calls at once and collects the replies with local
+  filters on the connection while `process` dispatches systemd's signals as usual (~10 ms
+  measured in Python, less in Rust). A unit without an answer (an error, a 5 s timeout) is asked
+  for alone, as upstream does, so the result is the same. In both scopes (system and user).
 - The wrapper (`bin/switch-to-configuration`, which sets the environment) stays upstream's; the
   program it runs is swapped in the toplevel's builder. The build fails if the wrapper isn't
   made as before, and if the patch doesn't apply to a new nixpkgs.

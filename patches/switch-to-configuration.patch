@@ -1,6 +1,107 @@
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -1324,6 +1324,129 @@
+@@ -1142,6 +1142,73 @@ fn unit_file_state(unit_file: impl AsRef<Path>) -> Result<UnitFileState> {
+ /// from the scope because by the time the user-scope child runs, /etc has
+ /// already been switched to the new configuration, so the caller must supply
+ /// a captured reference to the pre-switch unit directory.
++/// The FragmentPath of each unit, asked for all at once. Upstream asks one unit after the other,
++/// a round trip each: ~30 ms for the ~200 active units of a desktop, the longest part of planning
++/// a switch. The replies are collected by local filters while `process` dispatches everything
++/// else (systemd's signals) as usual. A unit without an answer (an error, a timeout) is missing,
++/// and the caller asks for it alone, as upstream does.
++fn fragment_paths(
++    conn: &LocalConnection,
++    units: &HashMap<String, UnitState>,
++) -> HashMap<String, String> {
++    use dbus::{
++        arg::Variant,
++        channel::{Channel, MatchingReceiver},
++        message::{MatchRule, MessageType},
++    };
++
++    let channel: &Channel = conn.channel();
++    let mut pending: HashMap<u32, String> = HashMap::new();
++    for (unit, state) in units {
++        let Ok(msg) = Message::new_method_call(
++            &*state.proxy.destination,
++            &*state.proxy.path,
++            "org.freedesktop.DBus.Properties",
++            "Get",
++        ) else {
++            continue;
++        };
++        let msg = msg.append2("org.freedesktop.systemd1.Unit", "FragmentPath");
++        if let Ok(serial) = channel.send(msg) {
++            pending.insert(serial, unit.clone());
++        }
++    }
++
++    let replies: Rc<RefCell<HashMap<u32, Option<String>>>> = Rc::default();
++    let tokens = [MessageType::MethodReturn, MessageType::Error].map(|ty| {
++        let replies = replies.clone();
++        let mut rule = MatchRule::new();
++        rule.msg_type = Some(ty);
++        conn.start_receive(
++            rule,
++            Box::new(move |msg: Message, _: &LocalConnection| {
++                if let Some(serial) = msg.get_reply_serial() {
++                    let path = msg.read1::<Variant<String>>().ok().map(|v| v.0);
++                    replies.borrow_mut().insert(serial, path);
++                }
++                true
++            }),
++        )
++    });
++    // The timeout upstream's proxies use for each call.
++    let deadline = std::time::Instant::now() + Duration::from_secs(5);
++    while replies.borrow().len() < pending.len() {
++        let left = deadline.saturating_duration_since(std::time::Instant::now());
++        if left.is_zero() || conn.process(left).is_err() {
++            break;
++        }
++    }
++    for token in tokens {
++        conn.stop_receive(token);
++    }
++
++    let replies = replies.take();
++    pending
++        .into_iter()
++        .filter_map(|(serial, unit)| Some((unit, replies.get(&serial)?.clone()?)))
++        .collect()
++}
++
+ fn collect_unit_changes(
+     toplevel: &Path,
+     scope: UnitScope,
+@@ -1162,13 +1229,23 @@ fn collect_unit_changes(
+     let start_list = scope.start_list_file();
+     let reload_list = scope.reload_list_file();
+ 
++    let fragment_paths = current_active_units
++        .values()
++        .next()
++        .map(|state| fragment_paths(state.proxy.connection, current_active_units))
++        .unwrap_or_default();
++
+     for (unit, unit_state) in current_active_units {
+         // Don't touch units that are not loaded from the NixOS-managed
+         // directory. For system scope this skips generator output; for user
+         // scope it additionally skips units shadowed by ~/.config/systemd/user.
+-        if !unit_state
+-            .proxy
+-            .get("org.freedesktop.systemd1.Unit", "FragmentPath")
++        let fragment_path = match fragment_paths.get(unit) {
++            Some(path) => Ok(path.clone()),
++            None => unit_state
++                .proxy
++                .get("org.freedesktop.systemd1.Unit", "FragmentPath"),
++        };
++        if !fragment_path
+             .map(|fragment_path: String| fragment_path.starts_with(fragment_prefix))
+             .unwrap_or_default()
+         {
+@@ -1324,6 +1401,129 @@ fn collect_unit_changes(
  }
  
  /// Performs switch-to-configuration functionality for a single non-root user
@@ -130,7 +231,7 @@
  fn do_user_switch(parent_exe: String) -> anyhow::Result<()> {
      if Path::new(&parent_exe)
          != Path::new("/proc/self/exe")
-@@ -1535,13 +1658,34 @@
+@@ -1535,13 +1735,34 @@ fn do_user_switch(parent_exe: String) -> anyhow::Result<()> {
          print_units("NOT restarting", &units_to_skip);
      }
  
@@ -170,7 +271,7 @@
  
      print_units("reloading", &units_to_reload);
      for unit in units_to_reload.keys() {
-@@ -2419,7 +2563,8 @@
+@@ -2419,7 +2640,8 @@ won't take effect until you reboot the system.
                      .context("Failed to get full path to /proc/self/exe")?;
  
                  log::debug!("Performing user switch for {name}");
@@ -180,7 +281,7 @@
                      .uid(uid)
                      .gid(metadata.gid())
                      .env_clear()
-@@ -2427,7 +2572,11 @@
+@@ -2427,7 +2649,11 @@ won't take effect until you reboot the system.
                      .env("__NIXOS_SWITCH_TO_CONFIGURATION_PARENT_EXE", &myself)
                      .env("TOPLEVEL", &toplevel)
                      .env("OLD_TOPLEVEL", &old_toplevel)
@@ -193,7 +294,7 @@
                      .spawn()
                      .with_context(|| format!("Failed to spawn user activation for {name}"))?
                      .wait()
-@@ -2608,7 +2757,9 @@
+@@ -2608,7 +2834,9 @@ won't take effect until you reboot the system.
      // Wait for events from systemd to settle. process() will return true if we have received any
      // messages on the bus.
      let mut waited = Duration::from_millis(0);
