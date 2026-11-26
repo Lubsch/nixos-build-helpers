@@ -42,7 +42,7 @@ the toplevel.
 
 ## Faster switches
 
-Two more options make `switch-to-configuration` (what a switch waits for after the build)
+Three more options make `switch-to-configuration` (what a switch waits for after the build)
 faster. Unlike the options above, they change behaviour, so they're tested by checking
 behaviour, not output:
 
@@ -50,6 +50,7 @@ behaviour, not output:
 |---|---|---|
 | `switchToConfiguration` | `switch-to-configuration` (patched, `patches/switch-to-configuration.patch`) | ~240 ms, ~140 ms more when systemd didn't change, ~70 ms more when nothing the user manager loads did |
 | `systemdBoot` | systemd-boot's installer (patched builder, `patches/systemd-boot-builder.patch`) | ~30 ms (one third of the installer), more on a real ESP |
+| `wrappers` | the script of `suid-sgid-wrappers.service` (upstream's, behind a check) | ~65-110 ms when the wrappers didn't change |
 
 `switchToConfiguration`:
 - Upstream waits for systemd's events to settle by polling D-Bus every 250 ms, until an interval
@@ -116,6 +117,23 @@ generations, after a first install (hyperfine, 30 runs):
 On a real ESP (vfat, fsync) and with a real `bootctl`, upstream's installer took ~185 ms in
 switches; the patched one saves the starts of bootctl, nix-env, bash and findmnt there too.
 `tests/systemd-boot.nix` checks that both write the same ESP, byte for byte.
+
+`wrappers` (only when nixpkgs defines `suid-sgid-wrappers.service`): `sysinit-reactivation.target`
+restarts the unit on every switch, and its script makes every wrapper again in a new directory,
+starting ~5 processes per wrapper (cp, chmod, chown, chmod; setcap): ~65-110 ms for 11 wrappers.
+The script rarely changes (it was the same in 24 generations in a row here). The option runs
+upstream's script unchanged, behind a check that skips it, with bash builtins only (no process):
+- After a run, a stamp (`/run/wrappers/.nixos-build-helpers-stamp`) records the hash of the script
+  and the directory it made. A later run with the same script skips when `/run/wrappers/bin` is
+  still that directory (`-ef`) and every wrapper exists in it.
+- So it runs again for a changed or new wrapper (another script), after a reboot (`/run` is a
+  tmpfs), after a run without the option (a new directory), and when a wrapper was deleted.
+- Not covered: a wrapper whose mode, owner, capabilities or contents someone changed by hand,
+  which a switch used to undo. Only root can write there.
+- The build fails if upstream's script no longer makes its directory with `mktemp` into
+  `$wrapperDir`, or doesn't name every wrapper as `"$wrapperDir/<program>"`. The VM test compares
+  the wrappers (mode, owner, size, capabilities) with nixpkgs' and checks the skip, a deleted
+  wrapper and a changed script.
 
 ### Future: a rewrite of the systemd-boot installer
 

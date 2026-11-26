@@ -15,7 +15,11 @@ let
       # stage 2 without the activation script
       system.nixos-init.enable = overlay;
 
-      environment.systemPackages = [ pkgs.foot.terminfo ];
+      # getcap: the wrappers' capabilities are compared with the reference's
+      environment.systemPackages = [
+        pkgs.foot.terminfo
+        pkgs.libcap
+      ];
       environment.etc."nbh-test" = {
         text = "-";
         mode = "0640";
@@ -44,6 +48,15 @@ let
       specialisation.userChanged.configuration = {
         systemd.user.services.nbh-test-user.environment.CHANGED = "1";
       };
+      # Another wrapper: the suid-sgid-wrappers script changes
+      specialisation.wrapperChanged.configuration = {
+        security.wrappers.nbh-test = {
+          source = "${pkgs.coreutils}/bin/true";
+          owner = "root";
+          group = "root";
+          setuid = true;
+        };
+      };
       # The same, plus a package with a user unit (in /run/current-system/sw, not /etc)
       specialisation.packageChanged.configuration = {
         systemd.user.services.nbh-test-user.environment.CHANGED = "1";
@@ -68,6 +81,7 @@ testers.runNixOSTest {
       fixDependencies = true;
       fewerDerivations = true;
       switchToConfiguration = true;
+      wrappers = true;
     };
   };
   # The same system without nixos-build-helpers
@@ -138,5 +152,27 @@ testers.runNixOSTest {
     log = user_manager_log(cursor)
     assert "Reloading finished" in log and "Reexecuting" not in log, log
     assert load_state("nbh-test-package.service") == "loaded"
+
+    # wrappers: the same wrappers as nixpkgs makes
+    wrappers = "stat -c '%n %a %U:%G %s' /run/wrappers/bin/* && getcap -r /run/wrappers/bin"
+    ours, theirs = (m.succeed(wrappers) for m in (machine, reference))
+    assert ours == theirs, f"{ours}\nvs. without nixos-build-helpers:\n{theirs}"
+    def wrapper_dir():
+        return machine.succeed("readlink -f /run/wrappers/bin").strip()
+    # The switches above didn't change the script, so they kept the wrappers made at boot,
+    # and so does a restart
+    made = wrapper_dir()
+    machine.succeed("systemctl restart suid-sgid-wrappers.service")
+    assert wrapper_dir() == made, "the unchanged script ran again"
+    # A deleted wrapper is made again
+    machine.succeed("rm /run/wrappers/bin/su")
+    machine.succeed("systemctl restart suid-sgid-wrappers.service")
+    assert wrapper_dir() != made
+    assert machine.succeed(wrappers) == ours
+    # Another script (a new wrapper) runs
+    made = wrapper_dir()
+    machine.succeed(f"{base}/specialisation/wrapperChanged/bin/switch-to-configuration test")
+    assert wrapper_dir() != made
+    machine.succeed("test -u /run/wrappers/bin/nbh-test")
   '';
 }

@@ -238,6 +238,44 @@ let
     chmod +x "$out"
   '';
 
+  # suid-sgid-wrappers: upstream's script, skipped when the wrappers it would create are in place.
+  # sysinit-reactivation.target restarts the unit on every switch, and the script starts ~5
+  # processes per wrapper (cp, chmod, chown, chmod; setcap), ~65-110 ms for 11 wrappers, though
+  # the script rarely changes (it was the same in 24 generations in a row on one machine).
+  # After a run, a stamp records the hash of the script and the directory it made. A later run
+  # with the same script skips when /run/wrappers/bin is still that directory and every wrapper is
+  # in it. Bash builtins only, so a skip starts no process. The upstream script is unchanged, so a
+  # changed or new wrapper, a reboot (/run is a tmpfs) or a run without this option (a new
+  # directory) makes it run again. Not restored by a skip: a wrapper whose mode, owner or contents
+  # someone changed by hand (deleting one is noticed).
+  upstreamWrappersScript = upstream.systemd.services.suid-sgid-wrappers.script;
+  wrappersDir = config.security.wrapperDir;
+  wrappersStamp = "${dirOf wrappersDir}/.nixos-build-helpers-stamp";
+  wrapperPrograms = map (w: w.program) (
+    lib.filter (w: w.enable) (lib.attrValues config.security.wrappers)
+  );
+  wrappersScriptHash = builtins.hashString "sha256" (
+    builtins.unsafeDiscardStringContext upstreamWrappersScript
+  );
+  wrappersPresent = lib.concatMapStrings (
+    p: " && -e ${wrappersDir}/${lib.escapeShellArg p}"
+  ) wrapperPrograms;
+  wrappersScript = ''
+    # nixosBuildHelpers.wrappers: skip when this script already made the wrappers in place.
+    if [[ -e ${wrappersStamp} ]]; then
+      { read -r hash; read -r dir; } < ${wrappersStamp} || true
+      if [[ $hash == ${wrappersScriptHash} && -n $dir && ${wrappersDir} -ef $dir${wrappersPresent} ]]; then
+        exit 0
+      fi
+    fi
+    rm -f ${wrappersStamp}
+
+    ${upstreamWrappersScript}
+
+    # Only reached when everything above succeeded (unit scripts run with `set -e`).
+    printf '%s\n' ${wrappersScriptHash} "$wrapperDir" > ${wrappersStamp}
+  '';
+
   # The shape of upstream's build command for buildEnv, which we replace.
   upstreamBuildEnvCommand = builtins.unsafeDiscardStringContext "${pkgs.buildPackages.perl}/bin/perl -w ${builtins.storeDir}/[a-z0-9]{32}-builder.pl\neval \"\\$postBuild\"\n";
 in
@@ -250,6 +288,7 @@ in
     fixDependencies = mkEnableOption "removing the dependency of /etc on `system.path`, so they build in parallel and /etc isn't rebuilt when only packages change";
     switchToConfiguration = mkEnableOption "a patched `switch-to-configuration` that waits less: 10 ms instead of 250 ms for systemd's events to settle, and the user managers are only reexecuted when their systemd or user.conf changes, and only reloaded when something on their unit search path, their generators or what those read changed with the toplevel, and the unit files of the active units are looked up in one batch of D-Bus calls instead of one call after the other. Unlike the other options, this changes behaviour (see the README)";
     systemdBoot = mkEnableOption "a patched systemd-boot installer that starts fewer processes (no nix-env, check-mountpoints or an empty copy-extra-files script; bootctl only when the systemd package changes) and runs byte-compiled. Unlike the other options, this changes behaviour (see the README)";
+    wrappers = mkEnableOption "skipping upstream's suid-sgid-wrappers script when the wrappers it would create are in place (every switch restarts it: ~65-110 ms). Unlike most options, this changes behaviour: a switch no longer restores a wrapper changed by hand (see the README)";
     fewerDerivations = mkEnableOption "fewer derivations on the way from a change to the toplevel: `environment.etc.*.text` that refers to no store paths is written at evaluation time (`builtins.toFile`), the activation script and boot.json don't depend on /etc, and with `systemdUnits`, units are written by the units' derivation instead of one derivation each";
   };
 
@@ -379,6 +418,10 @@ in
       '';
     })
 
+    (mkIf (cfg.wrappers && upstream.systemd.services ? suid-sgid-wrappers) {
+      systemd.services.suid-sgid-wrappers.script = mkForce wrappersScript;
+    })
+
     (mkIf (cfg.systemdBoot && config.boot.loader.systemd-boot.enable) {
       system.build.installBootLoader = mkForce systemdBootInstaller;
       # For the VM test, which compares what both write to the ESP.
@@ -398,6 +441,14 @@ in
             cfg.buildEnv
             -> builtins.match upstreamBuildEnvCommand upstream.system.path.drvAttrs.buildCommand != null;
           message = "nixosBuildHelpers.buildEnv: the build command of nixpkgs' buildEnv changed. nixos-build-helpers needs an update.";
+        }
+        {
+          # The stamp records the directory upstream's script made, by its variable.
+          assertion =
+            cfg.wrappers
+            -> lib.hasInfix "wrapperDir=$(mktemp --directory" upstreamWrappersScript
+              && lib.all (p: lib.hasInfix "\"$wrapperDir/${p}\"" upstreamWrappersScript) wrapperPrograms;
+          message = "nixosBuildHelpers.wrappers: the shape of nixpkgs' suid-sgid-wrappers script changed. nixos-build-helpers needs an update.";
         }
       ];
       warnings =
