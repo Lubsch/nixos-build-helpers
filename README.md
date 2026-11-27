@@ -319,7 +319,7 @@ argument), or changes code that an enabled option reimplements or relies on (see
 [drift detection](#how-it-stays-correct)), so a nixpkgs update fails loudly instead of building
 something different. `nixosBuildHelpers.allowUpstreamChanges = true` turns the latter into
 warnings, e.g. to build with a newer nixpkgs before nixos-build-helpers is updated; the output may
-then differ from nixpkgs'.
+then differ from nixpkgs'. See [Updating nixpkgs](#updating-nixpkgs).
 
 ## How it stays correct
 
@@ -343,8 +343,11 @@ then differ from nixpkgs'.
 - **Drift detection** (`upstream-code.nix`): hashes of the code in nixpkgs we reimplement or rely
   on (`builder.pl`, `build-composefs-dump.py`, `generateUnits`, the etc builder, the
   `install-info` loop of `documentation.nix` and texinfo's version, `xdg/mime.nix`'s
-  update-mime-database and the versions of shared-mime-info, glib and libxml2, the lines using `system.path`
-  for `fixDependencies`, the fields of nixos-init's bootspec extension for `fewerDerivations`). The module checks those of the enabled options at evaluation time against
+  update-mime-database and the versions of shared-mime-info, glib and libxml2, the lines using
+  `system.path` for `fixDependencies`, the fields of nixos-init's bootspec extension for
+  `fewerDerivations`). The versions of texinfo and shared-mime-info only count when `system.path`
+  runs them (`documentation.info`, `xdg.mime`). The module checks those of the enabled options at
+  evaluation time against
   the nixpkgs the system is built with (`lib/upstream-check.nix`, a few ms), so a nixpkgs that
   follows yours fails the build, not only this repository's `nix flake check`.
   `tests/upstream.nix` checks the same with sed and grep (which also tests the module's
@@ -358,6 +361,66 @@ then differ from nixpkgs'.
   `tests/systemd-boot.nix` installs systemd-boot to an extra disk with upstream's installer and
   ours and compares the ESPs, checks that bootctl is skipped only with the marker, and that an
   unmounted ESP still fails.
+
+## Updating nixpkgs
+
+nixos-build-helpers is tested against the nixpkgs in `flake.lock`. To update it:
+
+```sh
+nix flake update nixpkgs
+nix flake check -L                  # differential tests, drift detection, VM tests
+nix build -L .#tests.matrix         # every combination of options
+nix run .#bench -- rebuild          # nothing got slower
+```
+
+To test against another nixpkgs without updating the lock, e.g. the one a system follows:
+`nix flake check -L --override-input nixpkgs github:NixOS/nixpkgs/<rev>`. The comparisons with
+nixpkgs' tools (install-info, update-mime-database, stdenv's setup) then use that nixpkgs' tools.
+
+What can fail, and what to do:
+
+- **A hash in `upstream-code.nix`** (`checks.upstream` prints `CHANGED: <file> (<range>):
+  <hash>`, the module fails with `nixpkgs changed <file>`): review the change, e.g.
+  `git diff <old-rev> <new-rev> -- <file>` in nixpkgs. Port what changed to the builder that
+  reimplements it (and add a case to `tests/configs.nix` or `tests/fixtures.nix` that exercises it),
+  then replace the hash with the printed one. For a change that doesn't matter (a comment,
+  formatting), only the hash.
+- **The uses of `system.path`**: look at what's new or changed in the printed lines. A use at run
+  time (a path in a unit, a file in /etc, a restart trigger) works with `fixDependencies`; a use at
+  build time (a derivation reading `system.path`'s contents) doesn't and needs an exception. Also
+  add a new file to `systemPathUses.files`.
+- **What stdenv's setup provides** (`checks.upstream` prints the new exports or functions): a new
+  export that can change what `postBuild` writes needs to be set in `withoutStdenv` in
+  `module.nix` (or marked as not set in `upstream-code.nix`); new functions go into the list as
+  printed, so that a `postBuild` using one keeps stdenv.
+- **texinfo's version**: diff `install-info/install-info.c` between the two releases and port what
+  changed to `src/install_info.rs`. `nix build -L .#checks.x86_64-linux.install-info` compares it
+  with the new install-info; for a longer run:
+  `TEST_SEED=1 python3 tests/install-info.py <texinfo>/bin/install-info <nixos-build-helpers> <system.path>/share/info 5000`.
+  Then add the version to `texinfo.versions`.
+- **shared-mime-info's, glib's or libxml2's version**: diff what the port reimplements:
+  `src/update-mime-database.cpp` of shared-mime-info (its version also ends up in the `version`
+  file, from the package's version), `glib/ghash.c` (`g_str_hash`, lookup, insertion,
+  `g_hash_table_maybe_resize`, `g_hash_table_resize`, `g_hash_table_foreach`), libxml2's parser
+  where it builds trees (namespaces, attribute defaults and normalization), `xmlStaticCopyNode`,
+  `xmlCopyProp`, `xmlsave.c` and the escape tables (`codegen/escape.inc`). Port what changed,
+  then run `nix build -L .#checks.x86_64-linux.update-mime-database`, and for a longer run
+  `TEST_SEED=1 python3 tests/update-mime-database.py <shared-mime-info>/bin/update-mime-database <version> <nixos-build-helpers> <system.path>/share/mime/packages 5000`
+  (the port must not run update-mime-database for real package files: it fails then). Add the
+  versions to `sharedMimeInfo`.
+- **nixos-init's bootspec extension has a new field**: if it refers to /etc, `fewerDerivations`
+  must add it in the toplevel's builder like `etc_metadata_image`; then add it to
+  `nixosInitBootspecFields`.
+- **An assertion about the shape of nixpkgs' code** (the arguments of `generateUnits`, buildEnv's
+  build command, the etc activation commands, the wrappers script) or **a patch that doesn't
+  apply** (`patches/switch-to-configuration.patch`, `patches/systemd-boot-builder.patch`): adapt
+  the module, or rebase the patch onto the new file. The VM tests and `tests/systemd-boot.nix`
+  check the behaviour.
+- **A differential test** (`compare-trees.py` lists the differing entries): nixpkgs' output
+  changed in a way the hashes don't cover, e.g. through a dependency of a builder. Port it.
+
+Until nixos-build-helpers is updated, `nixosBuildHelpers.allowUpstreamChanges = true` builds a
+system with a newer nixpkgs anyway (with warnings), or disable the affected option.
 
 ## Benchmarks
 

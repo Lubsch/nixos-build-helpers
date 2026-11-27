@@ -11,7 +11,7 @@ update-mime-database (both then ran it).
 """
 import hashlib, os, random, subprocess, sys, tempfile
 real, version, ours, corpus, iters = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
-seed = 0
+seed = int(os.environ.get("TEST_SEED", "0"))
 env = {k: v for k, v in os.environ.items() if not k.startswith(("LC_", "LANG"))}
 env["PKGSYSTEM_ENABLE_FSYNC"] = "0"
 rng = random.Random(seed)

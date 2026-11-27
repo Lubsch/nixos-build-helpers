@@ -382,7 +382,15 @@ let
     texinfo = pkgs.buildPackages.texinfo;
     inherit (pkgs.buildPackages) glib libxml2;
     shared-mime-info = sharedMimeInfo;
+    # Only checked with buildEnv (upstream's system.path is evaluated then anyway)
+    runsInstallInfo = inUpstreamPostBuild installInfoLoop;
+    runsUpdateMimeDatabase = inUpstreamPostBuild mimeUpdate;
   };
+  inUpstreamPostBuild =
+    snippet:
+    lib.hasInfix (builtins.unsafeDiscardStringContext snippet) (
+      builtins.unsafeDiscardStringContext upstream.system.path.drvAttrs.postBuild
+    );
   needsUpdate = "nixos-build-helpers needs an update (or set nixosBuildHelpers.allowUpstreamChanges to only warn).";
 
   # fewerDerivations with the overlay: the fields of nixos-init's bootspec extension upstream.

@@ -9,8 +9,10 @@
   # option name -> bool
   enabled,
   # the texinfo whose install-info system.path runs, the update-mime-database it runs, and
-  # what that one uses
+  # what that one uses; whether system.path's postBuild runs them
   texinfo,
+  runsInstallInfo,
+  runsUpdateMimeDatabase,
   shared-mime-info,
   glib,
   libxml2,
@@ -77,13 +79,16 @@ let
 
   texinfoChanged = {
     options = [ "buildEnv" ];
+    active = runsInstallInfo;
     changed =
-      texinfo.version != code.texinfo.version || map toString (texinfo.patches or [ ]) != code.texinfo.patches;
+      !lib.elem texinfo.version code.texinfo.versions
+      || map toString (texinfo.patches or [ ]) != code.texinfo.patches;
     what = "texinfo (${texinfo.version}), whose install-info src/install_info.rs reimplements";
   };
 
   mimeChanged = with code.sharedMimeInfo; {
     options = [ "buildEnv" ];
+    active = runsUpdateMimeDatabase;
     changed =
       !lib.elem shared-mime-info.version versions
       || map toString (shared-mime-info.patches or [ ]) != patches
@@ -117,5 +122,5 @@ let
   };
 in
 map (c: "nixosBuildHelpers.${lib.concatStringsSep "/" c.options}: nixpkgs changed ${c.what}, which nixos-build-helpers reimplements or relies on.") (
-  lib.filter (c: any c.options && c.changed) (reimplemented ++ [ inlineMax texinfoChanged mimeChanged systemPathUses ])
+  lib.filter (c: any c.options && (c.active or true) && c.changed) (reimplemented ++ [ inlineMax texinfoChanged mimeChanged systemPathUses ])
 )

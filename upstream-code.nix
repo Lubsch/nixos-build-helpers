@@ -67,7 +67,8 @@
     }
   ];
 
-  # buildEnv: src/update_mime_database.rs is a port of update-mime-database.cpp of these
+  # buildEnv, when system.path runs update-mime-database (xdg.mime):
+  # src/update_mime_database.rs is a port of update-mime-database.cpp of these
   # versions (2.4 and 2.5.1 differ only in their version), unpatched, and of what it uses of
   # glib's hash table (src/ghash.rs) and libxml2 (src/mime_xml.rs), in the versions it was
   # compared with.
@@ -87,9 +88,10 @@
     ];
   };
 
-  # buildEnv: src/install_info.rs is a port of install-info.c of this texinfo, unpatched
+  # buildEnv, when system.path runs install-info (documentation.info): src/install_info.rs is a
+  # port of install-info.c of these texinfo versions, unpatched
   texinfo = {
-    version = "7.2";
+    versions = [ "7.2" ];
     patches = [ ];
   };
 

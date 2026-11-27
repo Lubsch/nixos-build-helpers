@@ -19,7 +19,7 @@ import tempfile
 
 real, ours, corpus_dir, iterations = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 env = {k: v for k, v in os.environ.items() if not k.startswith(("LC_", "LANG"))}
-rng = random.Random(0)
+rng = random.Random(int(os.environ.get("TEST_SEED", "0")))
 
 
 def run_both(files: list[str]) -> tuple[tuple, tuple, int]:
