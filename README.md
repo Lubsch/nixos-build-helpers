@@ -13,13 +13,25 @@ reimplementation that produces **identical output** (checked by differential tes
 | `fixDependencies` | — | see below |
 | `fewerDerivations` | — | see below |
 
-`fixDependencies` doesn't replace a builder but cuts the dependency of /etc on `system.path`:
+`fixDependencies` doesn't replace a builder but cuts the dependencies on `system.path`:
 upstream, /etc links the dbus configuration and `/etc/terminfo` (and through dbus, the units)
 to `system.path`, so /etc is rebuilt whenever a package is added or removed, and can't be built
-before `system.path` is. With `fixDependencies`, they refer to `/run/current-system/sw` instead,
-which is the same `system.path` at run time. Use `nix run .#check-deps -- <installable>` to
-check that /etc of a system doesn't depend on `system.path` anymore (it walks the derivation
-graph and prints the chain if it does). Other modules can still add such dependencies.
+before `system.path` is. Other modules do the same: polkit's `restartTriggers`, the environment
+of accounts-daemon and paretosecurity, the crontabs of cron and fcron, GNOME's and LXQt's session
+variables. With `fixDependencies`, `config.system.path` is a stand-in with the attributes of the
+real one, which interpolates to `/run/current-system/sw`, without string context: the same
+`system.path` at run time. So every module referring to it resolves it at run time, including
+ones added later or outside nixpkgs. The toplevel's `sw` links the real one, which is also
+`system.build.systemPath`. Use `nix run .#check-deps -- <installable>` to check that /etc of a
+system doesn't depend on `system.path` (it walks the derivation graph and prints the chain if it
+does). A module that reads the contents of `system.path` at build time would fail to build.
+
+What changes at run time: services that were restarted on every package change only because they
+referred to `system.path` aren't anymore. polkit's `restartTriggers` become constant, so polkit
+picks up actions of a newly added package only after `systemctl restart polkit` (or a reboot), and
+accounts-daemon new interfaces only after a restart too. Everything referring to it sees the new
+packages right after the switch, through `/run/current-system/sw`, also processes that were already
+running.
 
 `fewerDerivations` removes derivations from the way between a change and the toplevel. Each
 level costs ~0.1 s, mostly nix's scheduling, even when the build itself takes milliseconds:
@@ -259,9 +271,9 @@ argument), so a nixpkgs update fails loudly instead of building something differ
 
 - **Wrapping instead of copying.** The module evaluates the system once more without its own
   options (`extendModules`, sharing `pkgs`, ~0.1 s) and wraps upstream's values: `buildEnv`
-  only swaps the build command of upstream's `system.path`, `fixDependencies` replaces only the
-  `system.path` element of upstream's `services.dbus.packages`. Changes in nixpkgs (another
-  `postBuild` step, another module adding dbus packages) carry over.
+  only swaps the build command of upstream's `system.path`, `fixDependencies` changes only what
+  `config.system.path` interpolates to. Changes in nixpkgs (another `postBuild` step, another
+  module referring to `system.path`) carry over.
 - **Differential tests** (`nix flake check`): every output is built by nixpkgs and by us and
   compared file by file, without following symlinks (`tests/compare-trees.py`), on a minimal
   configuration and one exercising the edge cases of every builder (`tests/configs.nix`,

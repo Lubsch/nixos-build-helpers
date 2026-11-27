@@ -27,8 +27,25 @@ let
   };
   upstream = upstreamSystem.config;
 
-  # Comparing derivations (==) would evaluate upstream's system.path just for that (~0.2 s).
-  isSystemPath = p: lib.isDerivation p && p.name == upstream.system.path.name;
+  # system.path as it's built: upstream's, with buildEnv by our builder.
+  systemPath =
+    if cfg.buildEnv then
+      upstream.system.path.overrideAttrs {
+        buildCommand = ''
+          ${exe} build-env
+          eval "$postBuild"
+        '';
+      }
+    else
+      upstream.system.path;
+
+  # With fixDependencies, what modules get as config.system.path: the same attributes, but
+  # interpolated it's /run/current-system/sw, without string context. So whatever refers to it
+  # (dbus' service directories, /etc/terminfo, crontabs, unit environments, restartTriggers, …)
+  # resolves it at run time, and doesn't depend on it at build time. The toplevel links the real one.
+  systemPathAtRunTime = systemPath // {
+    outPath = "/run/current-system/sw";
+  };
 
   # Only the attributes our builders read. Passing whole entries would put e.g. every `text` into
   # the derivation a second time.
@@ -285,7 +302,7 @@ in
     etcOverlay = mkEnableOption "the faster builder for `system.build.etcMetadataImage` (used with `system.etc.overlay`). Implies `etc`";
     systemdUnits = mkEnableOption "the faster builder for systemd units (system-units, user-units, initrd-units, nspawn-units)";
     buildEnv = mkEnableOption "the faster builder for `system.path`";
-    fixDependencies = mkEnableOption "removing the dependency of /etc on `system.path`, so they build in parallel and /etc isn't rebuilt when only packages change";
+    fixDependencies = mkEnableOption "removing the dependencies on `system.path` (of /etc, units, …): `config.system.path` refers to /run/current-system/sw, so they build in parallel and aren't rebuilt when only packages change. Services that were restarted on every package change because they referred to it (polkit's restartTriggers, accounts-daemon's XDG_DATA_DIRS) aren't anymore (see the README)";
     switchToConfiguration = mkEnableOption "a patched `switch-to-configuration` that waits less: 10 ms instead of 250 ms for systemd's events to settle, and the user managers are only reexecuted when their systemd or user.conf changes, and only reloaded when something on their unit search path, their generators or what those read changed with the toplevel, and the unit files of the active units are looked up in one batch of D-Bus calls instead of one call after the other. Unlike the other options, this changes behaviour (see the README)";
     systemdBoot = mkEnableOption "a patched systemd-boot installer that starts fewer processes (no nix-env, check-mountpoints or an empty copy-extra-files script; bootctl only when the systemd package changes) and runs byte-compiled. Unlike the other options, this changes behaviour (see the README)";
     wrappers = mkEnableOption "skipping upstream's suid-sgid-wrappers script when the wrappers it would create are in place (every switch restarts it: ~65-110 ms). Unlike most options, this changes behaviour: a switch no longer restores a wrapper changed by hand (see the README)";
@@ -384,24 +401,22 @@ in
       );
     })
 
-    (mkIf cfg.buildEnv {
-      system.path = mkForce (
-        upstream.system.path.overrideAttrs {
-          buildCommand = ''
-            ${exe} build-env
-            eval "$postBuild"
-          '';
-        }
-      );
+    (mkIf (cfg.buildEnv && !cfg.fixDependencies) {
+      system.path = mkForce systemPath;
     })
 
     (mkIf cfg.fixDependencies {
-      # dbus reads its service directories from system.path at build time, which makes /etc (and
-      # every unit referring to the dbus config) depend on it. Resolve it at run time instead.
-      services.dbus.packages = mkForce (
-        map (p: if isSystemPath p then "/run/current-system/sw" else p) upstream.services.dbus.packages
-      );
-      environment.etc.terminfo.source = mkForce "/run/current-system/sw/share/terminfo";
+      system.path = mkForce systemPathAtRunTime;
+      # The real one, e.g. for `nix build .#nixosConfigurations.<name>.config.system.build.systemPath`
+      system.build.systemPath = systemPath;
+      # Upstream's builder linked config.system.path, i.e. /run/current-system/sw, before this.
+      system.systemBuilderCommands = ''
+        if [[ $(readlink "$out/sw") != ${systemPathAtRunTime} ]]; then
+          echo "nixosBuildHelpers.fixDependencies: the toplevel no longer links config.system.path as sw. nixos-build-helpers needs an update." >&2
+          exit 1
+        fi
+        ln -sfn ${systemPath} $out/sw
+      '';
     })
 
     (mkIf (cfg.switchToConfiguration && config.system.switch.enable) {
@@ -451,9 +466,6 @@ in
           message = "nixosBuildHelpers.wrappers: the shape of nixpkgs' suid-sgid-wrappers script changed. nixos-build-helpers needs an update.";
         }
       ];
-      warnings =
-        lib.optional (cfg.fixDependencies && !lib.any isSystemPath upstream.services.dbus.packages)
-          "nixosBuildHelpers.fixDependencies: nixpkgs' services.dbus.packages no longer contains system.path, the dbus override is obsolete.";
     }
   ];
 }

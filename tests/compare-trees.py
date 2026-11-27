@@ -1,6 +1,6 @@
 """Compare two file trees (or composefs dumps) without following symlinks.
 
-Usage: compare-trees.py [--normalize] [--deref] [--ignore NAME]... [--subst FROM=TO]... REFERENCE TEST
+Usage: compare-trees.py [--normalize] [--deref] [--ignore NAME]... [--subst FROM=TO]... [--subst-ref FROM=TO]... REFERENCE TEST
 
 Symlink targets are compared textually and regular files by permissions and content.
 --normalize replaces store path hashes in symlink targets and file contents. Use it when
@@ -11,6 +11,9 @@ different (separately tested) builder, e.g. units referring to system.path.
 --ignore skips a top-level entry.
 --subst replaces FROM by TO in the contents of TEST's files (after normalizing), for differences
 that are intended.
+--subst-ref replaces FROM by TO in REFERENCE's file contents and symlink targets (after
+normalizing, before --deref decides whether a target is in the store), e.g. a store path that
+the test resolves at run time instead.
 """
 
 import hashlib
@@ -29,7 +32,9 @@ def normalize(data: bytes, enabled: bool, subst: list[tuple[bytes, bytes]] = [])
     return data
 
 
-def listing(root: Path, norm: bool, subst: list[tuple[bytes, bytes]] = [], deref: bool = False) -> dict[str, str]:
+def listing(
+    root: Path, norm: bool, subst: list[tuple[bytes, bytes]] = [], deref: bool = False, link_subst: bool = False
+) -> dict[str, str]:
     if root.is_file():  # a single file, e.g. a composefs dump
         return {".": hashlib.sha256(normalize(root.read_bytes(), norm, subst)).hexdigest()}
     entries = {}
@@ -38,7 +43,10 @@ def listing(root: Path, norm: bool, subst: list[tuple[bytes, bytes]] = [], deref
             path = Path(dirpath) / name
             rel = str(path.relative_to(root))
             st = path.lstat()
-            if path.is_symlink() and deref and os.readlink(path).startswith("/nix/store/"):
+            link = path.is_symlink() and os.fsencode(os.readlink(path))
+            if link and link_subst and normalize(link, norm, subst) != normalize(link, norm):
+                entries[rel] = "symlink -> " + normalize(link, norm, subst).decode(errors="backslashreplace")
+            elif path.is_symlink() and deref and os.readlink(path).startswith("/nix/store/"):
                 resolved = path.resolve()
                 if resolved.is_file():
                     digest = hashlib.sha256(normalize(resolved.read_bytes(), norm, subst)).hexdigest()
@@ -57,7 +65,7 @@ def listing(root: Path, norm: bool, subst: list[tuple[bytes, bytes]] = [], deref
 
 
 def main() -> int:
-    args, ignore, norm, subst, deref = sys.argv[1:], set(), False, [], False
+    args, ignore, norm, subst, subst_ref, deref = sys.argv[1:], set(), False, [], [], False
     while args[0].startswith("--"):
         opt = args.pop(0)
         if opt == "--normalize":
@@ -69,8 +77,11 @@ def main() -> int:
         elif opt == "--subst":
             frm, to = args.pop(0).split("=", 1)
             subst.append((frm.encode(), to.encode()))
+        elif opt == "--subst-ref":
+            frm, to = args.pop(0).split("=", 1)
+            subst_ref.append((frm.encode(), to.encode()))
     ref, test = (Path(a) for a in args)
-    a, b = listing(ref, norm, [], deref), listing(test, norm, subst, deref)
+    a, b = listing(ref, norm, subst_ref, deref, link_subst=True), listing(test, norm, subst, deref)
     bad = 0
     for rel in sorted((a.keys() | b.keys()) - ignore):
         if a.get(rel) != b.get(rel):

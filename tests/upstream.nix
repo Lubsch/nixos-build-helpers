@@ -49,6 +49,16 @@ runCommand "test-upstream" { } ''
     '') reimplemented
   )}
 
+  # fixDependencies: every use of system.path in nixpkgs' modules. A new one, or a changed one,
+  # needs a look: one that reads system.path at build time would break with /run/current-system/sw
+  # (at run time, a module referring to it e.g. in restartTriggers changes behaviour, see the README).
+  actual=$(grep -rH --include='*.nix' 'system\.path\b' nixos/modules | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+  if [ "$actual" != c9f971379eb21bf89f1ddcd038c97ac2096e71f3a51c647dd48a11a43b7096ae ]; then
+    echo "CHANGED: the uses of system.path in nixos/modules (fixDependencies): $actual"
+    grep -rH --include='*.nix' 'system\.path\b' nixos/modules | LC_ALL=C sort
+    failed=1
+  fi
+
   grep -q 'etcInlineContentMax = 4096;' nixos/modules/system/etc/etc.nix \
     || { echo "CHANGED: etcInlineContentMax (INLINE_CONTENT_MAX in build_composefs_dump.rs)"; failed=1; }
 

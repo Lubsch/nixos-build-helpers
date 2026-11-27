@@ -77,7 +77,8 @@ let
       }) units
       // {
         system-path = {
-          drv = c.system.path;
+          # With fixDependencies, config.system.path is /run/current-system/sw
+          drv = c.system.build.systemPath or c.system.path;
           inputs = [ ];
         };
         etc = {
@@ -196,33 +197,75 @@ let
   # fixDependencies changes /etc by design. Check that it only changes what it should.
   fixDependencies =
     let
-      test = mkSystem {
-        config = configs.featureful;
-        overlay = false;
-        options.fixDependencies = true;
+      # Modules that refer to system.path at run time
+      users = {
+        security.polkit.enable = true;
+        services.accounts-daemon.enable = true;
+        services.cron = {
+          enable = true;
+          systemCronJobs = [ "* * * * * root true" ];
+        };
       };
-      ref = mkSystem {
-        config = configs.featureful;
-        overlay = false;
-        options = { };
-      };
+      mk =
+        options:
+        mkSystem {
+          config = {
+            imports = [
+              configs.featureful
+              users
+            ];
+          };
+          overlay = false;
+          inherit options;
+        };
+      test = mk { fixDependencies = true; };
+      ref = mk { };
       c = test.config;
+      sw = "/run/current-system/sw";
       expectedDbus = map (
-        p: if p == ref.config.system.path then "/run/current-system/sw" else toString p
+        p: if p == ref.config.system.path then sw else toString p
       ) ref.config.services.dbus.packages;
+      noContext = s: !builtins.hasContext s;
+      # Everything else must be upstream's, with system.path replaced by ${sw}: a module that reads
+      # system.path at build time and quietly skips what it can't find would show up here.
+      refComponents = components ref.config;
+      compareWithUpstream = lib.concatStrings (
+        lib.mapAttrsToList (name: { drv, ... }: ''
+          echo "== ${name} (vs upstream, files behind store links compared)"
+          ${compare} --normalize --deref --ignore sw --ignore extra-dependencies \
+            --subst-ref '/nix/store/<hash>-system-path=${sw}' \
+            ${refComponents.${name}.drv} ${drv} || failed=1
+        '') (removeAttrs (components c) [ "system-path" ])
+      );
       check = msg: cond: lib.optionalString (!cond) "echo 'FAIL: ${msg}'; failed=1\n";
     in
     pkgs.runCommand "test-fix-dependencies" { } ''
       failed=0
+      ${check "system.path is ${sw}, without context" (
+        "${c.system.path}" == sw && noContext "${c.system.path}"
+      )}
+      ${check "system.build.systemPath is upstream's system.path" (
+        c.system.build.systemPath.drvPath == ref.config.system.path.drvPath
+      )}
       ${check "dbus packages are upstream's with system.path replaced" (
         map toString c.services.dbus.packages == expectedDbus
       )}
       ${check "dbus packages that aren't in systemPackages are kept" (
         lib.elem fixtures.dbusOnly c.services.dbus.packages
       )}
-      ${check "terminfo points at /run/current-system/sw" (
-        c.environment.etc.terminfo.source == "/run/current-system/sw/share/terminfo"
+      ${check "terminfo points at ${sw}" (c.environment.etc.terminfo.source == "${sw}/share/terminfo")}
+      ${check "polkit's restartTriggers are constant" (
+        map toString c.systemd.services.polkit.restartTriggers == [ sw ]
       )}
+      ${check "accounts-daemon finds its interfaces through ${sw}" (
+        c.systemd.services.accounts-daemon.environment.XDG_DATA_DIRS == "${sw}/share"
+      )}
+      grep -q '^PATH=${sw}/bin:${sw}/sbin$' ${c.environment.etc.crontab.source} \
+        || { echo "FAIL: the crontab's PATH is ${sw}"; failed=1; }
+      # The toplevel links the real system.path, which is all that refers to it
+      [[ $(readlink ${c.system.build.toplevel}/sw) == ${ref.config.system.path} ]] \
+        || { echo "FAIL: the toplevel's sw is upstream's system.path"; failed=1; }
+      ${compareWithUpstream}
       [ $failed = 0 ] && touch $out
     '';
 
