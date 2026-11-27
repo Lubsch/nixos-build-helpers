@@ -287,6 +287,23 @@ let
     minimal-overlay-all = mkTest "minimal" true (all // { etcOverlay = true; });
     fix-dependencies = fixDependencies;
     build-env = pkgs.callPackage ./build-env.nix { inherit fixtures compare; };
+    # buildEnv's update-mime-database, on the package files of the featureful system and
+    # generated ones
+    update-mime-database =
+      let
+        corpus =
+          (mkSystem {
+            config = configs.featureful;
+            overlay = false;
+            options = { };
+          }).config.system.path;
+        smi = pkgs.buildPackages.shared-mime-info;
+      in
+      pkgs.runCommand "test-update-mime-database" { } ''
+        ${lib.getExe pkgs.python3} ${./update-mime-database.py} ${smi}/bin/update-mime-database ${smi.version} \
+          ${lib.getExe (pkgs.callPackage ../package.nix { })} ${corpus}/share/mime/packages 400
+        touch $out
+      '';
     # buildEnv's install-info, on the Info files of the featureful system and generated ones
     install-info =
       let
