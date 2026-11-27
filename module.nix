@@ -293,6 +293,22 @@ let
     printf '%s\n' ${wrappersScriptHash} "$wrapperDir" > ${wrappersStamp}
   '';
 
+  # Upstream code that the enabled options reimplement or rely on, checked against this system's
+  # nixpkgs (see upstream-code.nix).
+  upstreamCode = import ./upstream-code.nix;
+  upstreamChanges = import ./lib/upstream-check.nix {
+    inherit lib;
+    pkgsRoot = pkgs.path;
+    nixosRoot = "${modulesPath}/../..";
+    enabled = cfg;
+  };
+  needsUpdate = "nixos-build-helpers needs an update (or set nixosBuildHelpers.allowUpstreamChanges to only warn).";
+
+  # fewerDerivations with the overlay: the fields of nixos-init's bootspec extension upstream.
+  nixosInitBootspecFields = lib.attrNames (
+    upstream.boot.bootspec.extensions."org.nixos.nixos-init.v1" or { }
+  );
+
   # The shape of upstream's build command for buildEnv, which we replace.
   upstreamBuildEnvCommand = builtins.unsafeDiscardStringContext "${pkgs.buildPackages.perl}/bin/perl -w ${builtins.storeDir}/[a-z0-9]{32}-builder.pl\neval \"\\$postBuild\"\n";
 in
@@ -306,6 +322,7 @@ in
     switchToConfiguration = mkEnableOption "a patched `switch-to-configuration` that waits less: 10 ms instead of 250 ms for systemd's events to settle, and the user managers are only reexecuted when their systemd or user.conf changes, and only reloaded when something on their unit search path, their generators or what those read changed with the toplevel, and the unit files of the active units are looked up in one batch of D-Bus calls instead of one call after the other. Unlike the other options, this changes behaviour (see the README)";
     systemdBoot = mkEnableOption "a patched systemd-boot installer that starts fewer processes (no nix-env, check-mountpoints or an empty copy-extra-files script; bootctl only when the systemd package changes) and runs byte-compiled. Unlike the other options, this changes behaviour (see the README)";
     wrappers = mkEnableOption "skipping upstream's suid-sgid-wrappers script when the wrappers it would create are in place (every switch restarts it: ~65-110 ms). Unlike most options, this changes behaviour: a switch no longer restores a wrapper changed by hand (see the README)";
+    allowUpstreamChanges = mkEnableOption "building when nixpkgs changed code that the enabled options reimplement or rely on (see upstream-code.nix), with a warning instead of an error. Their output may then differ from nixpkgs'";
     fewerDerivations = mkEnableOption "fewer derivations on the way from a change to the toplevel: `environment.etc.*.text` that refers to no store paths is written at evaluation time (`builtins.toFile`), the activation script and boot.json don't depend on /etc, and with `systemdUnits`, units are written by the units' derivation instead of one derivation each";
   };
 
@@ -332,7 +349,7 @@ in
   };
 
   config = lib.mkMerge [
-    (mkIf (lib.any lib.id (lib.attrValues cfg)) {
+    (mkIf (lib.any lib.id (lib.attrValues (removeAttrs cfg [ "allowUpstreamChanges" ]))) {
       # Keep the builder in the store, so that offline rebuilds work after garbage collection.
       system.extraDependencies = [ nixos-build-helpers ];
     })
@@ -465,7 +482,24 @@ in
               && lib.all (p: lib.hasInfix "\"$wrapperDir/${p}\"" upstreamWrappersScript) wrapperPrograms;
           message = "nixosBuildHelpers.wrappers: the shape of nixpkgs' suid-sgid-wrappers script changed. nixos-build-helpers needs an update.";
         }
-      ];
+        {
+          # A field added upstream might refer to /etc again.
+          assertion =
+            cfg.fewerDerivations && overlay
+            -> lib.elem "etc_metadata_image" nixosInitBootspecFields
+              && lib.all (f: lib.elem f upstreamCode.nixosInitBootspecFields) nixosInitBootspecFields;
+          message = "nixosBuildHelpers.fewerDerivations: the fields of nixpkgs' nixos-init bootspec extension changed (${toString nixosInitBootspecFields}). ${needsUpdate}";
+        }
+      ]
+      ++ lib.optionals (!cfg.allowUpstreamChanges) (
+        map (m: {
+          assertion = false;
+          message = "${m} ${needsUpdate}";
+        }) upstreamChanges
+      );
+      warnings = lib.optionals cfg.allowUpstreamChanges (
+        map (m: "${m} Its output may differ from nixpkgs'.") upstreamChanges
+      );
     }
   ];
 }

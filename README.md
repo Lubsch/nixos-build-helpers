@@ -265,7 +265,11 @@ Import and enable the module:
 ```
 
 The module asserts when nixpkgs changes in a way it can't handle (e.g. a new `generateUnits`
-argument), so a nixpkgs update fails loudly instead of building something different.
+argument), or changes code that an enabled option reimplements or relies on (see
+[drift detection](#how-it-stays-correct)), so a nixpkgs update fails loudly instead of building
+something different. `nixosBuildHelpers.allowUpstreamChanges = true` turns the latter into
+warnings, e.g. to build with a newer nixpkgs before nixos-build-helpers is updated; the output may
+then differ from nixpkgs'.
 
 ## How it stays correct
 
@@ -286,9 +290,15 @@ argument), so a nixpkgs update fails loudly instead of building something differ
   both must reject. Outputs whose inputs come from another of our builders (e.g. units referring
   to `system.path`) are compared with store hashes normalized; everything else is byte-exact.
   `nix build .#tests.matrix` runs all 24 combinations of options.
-- **Drift detection** (`tests/upstream.nix`): fails when nixpkgs changes any of the code we
-  reimplement (hashes of `builder.pl`, `build-composefs-dump.py`, `generateUnits` and the etc
-  builder). Review the upstream change, port it with a test, update the hash.
+- **Drift detection** (`upstream-code.nix`): hashes of the code in nixpkgs we reimplement or rely
+  on (`builder.pl`, `build-composefs-dump.py`, `generateUnits`, the etc builder, the lines using
+  `system.path` for `fixDependencies`, the fields of nixos-init's bootspec extension for
+  `fewerDerivations`). The module checks those of the enabled options at evaluation time against
+  the nixpkgs the system is built with (`lib/upstream-check.nix`, a few ms), so a nixpkgs that
+  follows yours fails the build, not only this repository's `nix flake check`.
+  `tests/upstream.nix` checks the same with sed and grep (which also tests the module's
+  implementation) and searches all of `nixos/modules` for new uses of `system.path`. Review the
+  upstream change, port it with a test, update the hash.
 - **VM tests** boot a system with all options, with and without the overlay, and switch to a
   changed configuration (units must be restarted, /etc updated).
   With `switchToConfiguration`, a user manager (a lingering user) must neither be reexecuted nor
