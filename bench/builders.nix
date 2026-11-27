@@ -83,9 +83,7 @@ lib.mapAttrs (_: map timed) (
     system-path = [ config.system.path ];
     system-units = [ etc."systemd/system".source ];
     user-units = [ etc."systemd/user".source ];
-    initrd-units =
-      lib.optional config.boot.initrd.systemd.enable
-        config.boot.initrd.systemd.contents."/etc/systemd/system".source;
+    initrd-units = config.boot.initrd.systemd.contents."/etc/systemd/system".source;
     etc = lib.optional (!overlay) config.system.build.etc;
     # Everything built for /etc with the overlay, including mkcomposefs and fsck.erofs, which all
     # variants run. (Upstream: etc, the dump and the image. The previous version: only the image,

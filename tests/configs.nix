@@ -8,7 +8,6 @@ let
       boot.loader.grub.devices = [ "/dev/sda" ];
       system.stateVersion = "26.05";
       system.etc.overlay.enable = overlay;
-      boot.initrd.systemd.enable = true;
       services.userborn.enable = lib.mkIf overlay true;
     };
 in
@@ -112,7 +111,6 @@ in
         nspawn.nbh.execConfig.Boot = true;
       };
       boot.initrd.systemd = {
-        enable = true;
         services.nbh-initrd = {
           script = "true";
           wantedBy = [ "initrd.target" ];

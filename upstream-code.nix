@@ -91,7 +91,7 @@
   # buildEnv, when system.path runs install-info (documentation.info): src/install_info.rs is a
   # port of install-info.c of these texinfo versions, unpatched
   texinfo = {
-    versions = [ "7.2" ];
+    versions = [ "7.2" "7.3" ];
     patches = [ ];
   };
 

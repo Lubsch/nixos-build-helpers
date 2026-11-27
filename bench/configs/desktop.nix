@@ -3,7 +3,6 @@
 # cache, so only the derivations our builders replace (and what depends on them) are built locally.
 {
   pkgs,
-  lib,
   overlay,
   ...
 }:
@@ -13,7 +12,6 @@
   system.stateVersion = "26.05";
 
   system.etc.overlay.enable = overlay;
-  boot.initrd.systemd.enable = true;
   services.userborn.enable = true;
 
   networking.networkmanager.enable = true;

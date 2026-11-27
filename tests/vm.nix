@@ -10,7 +10,6 @@ let
     { pkgs, ... }:
     {
       system.etc.overlay.enable = overlay;
-      boot.initrd.systemd.enable = true;
       services.userborn.enable = overlay;
       # stage 2 without the activation script
       system.nixos-init.enable = overlay;
