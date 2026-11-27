@@ -37,7 +37,10 @@ let
             ${exe} build-env
             eval "$postBuild"
           '';
-          postBuild = builtins.replaceStrings [ installInfoLoop ] [ installInfoAtOnce ] old.postBuild;
+          postBuild = builtins.replaceStrings [ installInfoLoop mimeUpdate ] [
+            installInfoAtOnce
+            mimeUpdateByUs
+          ] old.postBuild;
         }
         // lib.optionalAttrs (canSkipStdenv upstream.system.path) withoutStdenv
       )
@@ -55,6 +58,13 @@ let
     "  done\n"
   ];
   installInfoAtOnce = "  ${exe} install-info ${installInfo} $out/share/info/dir $out/share/info/*.info $out/share/info/*.info.gz\n";
+
+  # xdg/mime.nix's update-mime-database, and its port (src/update_mime_database.rs, which runs
+  # it for what it doesn't reproduce). Checked against upstream with upstream-code.nix.
+  sharedMimeInfo = pkgs.buildPackages.shared-mime-info;
+  updateMimeDatabase = "${sharedMimeInfo}/bin/update-mime-database";
+  mimeUpdate = "    XDG_DATA_DIRS=$out/share PKGSYSTEM_ENABLE_FSYNC=0 ${updateMimeDatabase} -V $out/share/mime > /dev/null\n";
+  mimeUpdateByUs = "    XDG_DATA_DIRS=$out/share PKGSYSTEM_ENABLE_FSYNC=0 ${exe} update-mime-database ${updateMimeDatabase} ${sharedMimeInfo.version} $out/share/mime > /dev/null\n";
 
   # Run a buildCommand without stdenv's setup, which takes ~35 ms of system.path's build: what of
   # it a buildCommand without inputs sees, i.e. its shell options, exports and PATH (see
@@ -370,6 +380,8 @@ let
     nixosRoot = "${modulesPath}/../..";
     enabled = cfg;
     texinfo = pkgs.buildPackages.texinfo;
+    inherit (pkgs.buildPackages) glib libxml2;
+    shared-mime-info = sharedMimeInfo;
   };
   needsUpdate = "nixos-build-helpers needs an update (or set nixosBuildHelpers.allowUpstreamChanges to only warn).";
 

@@ -8,8 +8,12 @@
   nixosRoot,
   # option name -> bool
   enabled,
-  # the texinfo whose install-info system.path runs
+  # the texinfo whose install-info system.path runs, the update-mime-database it runs, and
+  # what that one uses
   texinfo,
+  shared-mime-info,
+  glib,
+  libxml2,
 }:
 let
   code = import ../upstream-code.nix;
@@ -78,6 +82,16 @@ let
     what = "texinfo (${texinfo.version}), whose install-info src/install_info.rs reimplements";
   };
 
+  mimeChanged = with code.sharedMimeInfo; {
+    options = [ "buildEnv" ];
+    changed =
+      !lib.elem shared-mime-info.version versions
+      || map toString (shared-mime-info.patches or [ ]) != patches
+      || !lib.elem glib.version code.sharedMimeInfo.glib
+      || !lib.elem libxml2.version code.sharedMimeInfo.libxml2;
+    what = "shared-mime-info (${shared-mime-info.version}, glib ${glib.version}, libxml2 ${libxml2.version}), whose update-mime-database src/update_mime_database.rs reimplements";
+  };
+
   # grep -H 'system\.path\b' <files> | LC_ALL=C sort
   systemPathUses = with code.systemPathUses; {
     options = [ "fixDependencies" ];
@@ -103,5 +117,5 @@ let
   };
 in
 map (c: "nixosBuildHelpers.${lib.concatStringsSep "/" c.options}: nixpkgs changed ${c.what}, which nixos-build-helpers reimplements or relies on.") (
-  lib.filter (c: any c.options && c.changed) (reimplemented ++ [ inlineMax texinfoChanged systemPathUses ])
+  lib.filter (c: any c.options && c.changed) (reimplemented ++ [ inlineMax texinfoChanged mimeChanged systemPathUses ])
 )

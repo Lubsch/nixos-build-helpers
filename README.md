@@ -9,7 +9,7 @@ reimplementation that produces **identical output** (checked by differential tes
 | `etc` | `system.build.etc` | bash, one `makeEtcEntry` call per file |
 | `etcOverlay` | `system.build.etcMetadataImage` (with `system.etc.overlay`), implies `etc` | python (`build-composefs-dump.py`) in its own derivation. We build /etc and its image in one derivation |
 | `systemdUnits` | `system-units`, `user-units`, `initrd-units`, `nspawn-units` (`generateUnits`) | bash, several commands per unit |
-| `buildEnv` | `system.path` (`/run/current-system/sw`), and its `install-info` loop | perl (`buildenv/builder.pl`), one `install-info` per Info file |
+| `buildEnv` | `system.path` (`/run/current-system/sw`), its `install-info` loop and `update-mime-database` | perl (`buildenv/builder.pl`), one `install-info` per Info file, C++ |
 | `fixDependencies` | — | see below |
 | `fewerDerivations` | — | see below |
 
@@ -233,6 +233,34 @@ in `postBuild` (`update-mime-database` 162 ms, `install-info` 62 ms) and 160 ms 
 Together ~60 ms per package change (`desktop`: 637 → 576 ms, median of 8): `install-info` takes
 ~10 ms instead of 62, stdenv's setup ~20 ms instead of 50.
 
+`buildEnv` also replaces `xdg.mime`'s `update-mime-database` (162 ms) with
+`nixos-build-helpers update-mime-database`, a port of shared-mime-info's update-mime-database.cpp
+(2.4 to 2.5.1) that writes the same MIME database, byte for byte (~45 ms for the ~1050 files of
+`freedesktop.org.xml` and three more packages, against ~165 ms):
+- update-mime-database writes several files (`subclasses`, `icons`, the order of equal weights
+  in `globs`, the string table of `mime.cache` and so every offset in it) in the order of glib's
+  hash tables. `src/ghash.rs` is glib's GHashTable (hash, sizes, probing, the in-place resize),
+  so it iterates in the same order.
+- The per-type XML files are libxml2's: `src/mime_xml.rs` parses what xmlParseFile builds for the
+  package files (namespaces, references, the internal DTD subset's default `xmlns`, attribute
+  defaults and normalization), what xmlDocCopyNode does to a copied element's namespaces, and
+  xmlSaveFormatFileEnc's formatting and escaping. Its quirks are kept, e.g. `mime.cache` gets no
+  offsets for its type list (it looks up the lines of `types`, with their newline).
+- Anything it doesn't reproduce, it finds before writing anything and runs update-mime-database
+  instead: input outside of what it parses (entities, CDATA sections, processing instructions in
+  the document, external DTDs, malformed files, which update-mime-database skips with a warning),
+  numbers out of range (update-mime-database checks `errno` without resetting it), the glob `*`
+  (update-mime-database reads past its end), fsync enabled, a media directory that isn't one.
+- Not reproduced: update-mime-database's messages (`postBuild` sends its stdout to /dev/null,
+  its stderr goes to the build log).
+- Data oriented: the parsed files are flat arrays of nodes, attributes and namespaces with spans
+  of the input, the database is arrays linked by indices, the output is one buffer; the buffers
+  are allocated up front from counts of the input.
+- `tests/update-mime-database.py` compares the two on the test system's package files (which
+  must not need update-mime-database) and on generated ones covering what it processes. Locally,
+  it was also compared on 4000 generated runs, against 2.4 (glib 2.88.1, libxml2 2.15.3) and
+  2.5.1 (glib 2.90.0, libxml2 2.15.4), the versions `upstream-code.nix` accepts.
+
 **Rebuilding after a small change**, i.e. what `nixos-rebuild` waits for until activation
 (evaluation + build, median of 5):
 
@@ -314,7 +342,8 @@ then differ from nixpkgs'.
   `nix build .#tests.matrix` runs all 24 combinations of options.
 - **Drift detection** (`upstream-code.nix`): hashes of the code in nixpkgs we reimplement or rely
   on (`builder.pl`, `build-composefs-dump.py`, `generateUnits`, the etc builder, the
-  `install-info` loop of `documentation.nix` and texinfo's version, the lines using `system.path`
+  `install-info` loop of `documentation.nix` and texinfo's version, `xdg/mime.nix`'s
+  update-mime-database and the versions of shared-mime-info, glib and libxml2, the lines using `system.path`
   for `fixDependencies`, the fields of nixos-init's bootspec extension for `fewerDerivations`). The module checks those of the enabled options at evaluation time against
   the nixpkgs the system is built with (`lib/upstream-check.nix`, a few ms), so a nixpkgs that
   follows yours fails the build, not only this repository's `nix flake check`.

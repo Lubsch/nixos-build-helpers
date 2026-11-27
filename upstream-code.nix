@@ -55,7 +55,37 @@
       };
       sha256 = "74c53ba43fc937f5a905a063f73111b27e6220dd66812aef747b193f1218a7af";
     }
+    {
+      # The update-mime-database that buildEnv runs ported (src/update_mime_database.rs)
+      options = [ "buildEnv" ];
+      file = "nixos/modules/config/xdg/mime.nix";
+      range = {
+        from = "    environment.extraSetup = ''";
+        to = "    '';";
+      };
+      sha256 = "fff446e4860c9d9107dd31c2e1b04ea3f3945470aa89f62859b6910e2bcfc1fe";
+    }
   ];
+
+  # buildEnv: src/update_mime_database.rs is a port of update-mime-database.cpp of these
+  # versions (2.4 and 2.5.1 differ only in their version), unpatched, and of what it uses of
+  # glib's hash table (src/ghash.rs) and libxml2 (src/mime_xml.rs), in the versions it was
+  # compared with.
+  sharedMimeInfo = {
+    versions = [
+      "2.4"
+      "2.5.1"
+    ];
+    patches = [ ];
+    glib = [
+      "2.88.1"
+      "2.90.0"
+    ];
+    libxml2 = [
+      "2.15.3"
+      "2.15.4"
+    ];
+  };
 
   # buildEnv: src/install_info.rs is a port of install-info.c of this texinfo, unpatched
   texinfo = {
