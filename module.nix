@@ -30,14 +30,82 @@ let
   # system.path as it's built: upstream's, with buildEnv by our builder.
   systemPath =
     if cfg.buildEnv then
-      upstream.system.path.overrideAttrs {
-        buildCommand = ''
-          ${exe} build-env
-          eval "$postBuild"
-        '';
-      }
+      upstream.system.path.overrideAttrs (
+        old:
+        {
+          buildCommand = ''
+            ${exe} build-env
+            eval "$postBuild"
+          '';
+          postBuild = builtins.replaceStrings [ installInfoLoop ] [ installInfoAtOnce ] old.postBuild;
+        }
+        // lib.optionalAttrs (canSkipStdenv upstream.system.path) withoutStdenv
+      )
     else
       upstream.system.path;
+
+  # documentation.nix's loop running install-info once per Info file (~1.7 ms each), and the same
+  # in one process (src/install_info.rs, which runs install-info for what it doesn't reproduce).
+  # Checked against upstream with upstream-code.nix.
+  installInfo = "${pkgs.buildPackages.texinfo}/bin/install-info";
+  # As it is in postBuild, indented within documentation.nix's `if`
+  installInfoLoop = lib.concatStrings [
+    "  for i in $out/share/info/*.info $out/share/info/*.info.gz; do\n"
+    "      ${installInfo} $i $out/share/info/dir\n"
+    "  done\n"
+  ];
+  installInfoAtOnce = "  ${exe} install-info ${installInfo} $out/share/info/dir $out/share/info/*.info $out/share/info/*.info.gz\n";
+
+  # Run a buildCommand without stdenv's setup, which takes ~35 ms of system.path's build: what of
+  # it a buildCommand without inputs sees, i.e. its shell options, exports and PATH (see
+  # upstream-code.nix, whose `stdenv` tests/upstream.nix compares with stdenv's setup). Not its
+  # functions: canSkipStdenv keeps stdenv for a postBuild that mentions one.
+  withoutStdenv =
+    let
+      inherit (pkgs.stdenv) shell;
+    in
+    {
+      realBuilder = shell;
+      args = [
+        "-c"
+        ''
+          . "$NIX_ATTRS_SH_FILE"
+          set -e -o pipefail
+          shopt -s inherit_errexit nullglob
+          for o in "''${!outputs[@]}"; do export "$o=''${outputs[$o]}"; done
+          export PATH=${lib.makeBinPath pkgs.stdenv.initialPath} \
+            SHELL=${shell} CONFIG_SHELL=${shell} shell=${shell} \
+            SOURCE_DATE_EPOCH="''${SOURCE_DATE_EPOCH:-315532800}" TZ=UTC GZIP_NO_TIMESTAMPS=1 \
+            SSL_CERT_FILE=/no-cert-file.crt NIX_SSL_CERT_FILE=/no-cert-file.crt
+          eval "$buildCommand"
+        ''
+      ];
+    };
+  canSkipStdenv =
+    drv:
+    let
+      words = lib.filter (w: lib.isString w && w != "") (
+        builtins.split "[^[:alnum:]_]+" (drv.drvAttrs.postBuild or "")
+      );
+      stdenvFunctions = lib.genAttrs upstreamCode.stdenv.functions (_: null);
+    in
+    # Setup hooks of inputs would add to PATH or define functions
+    lib.all (a: drv.drvAttrs.${a} or [ ] == [ ]) [
+      "buildInputs"
+      "nativeBuildInputs"
+      "propagatedBuildInputs"
+      "propagatedNativeBuildInputs"
+      "depsBuildBuild"
+      "depsBuildBuildPropagated"
+      "depsBuildTarget"
+      "depsBuildTargetPropagated"
+      "depsHostHost"
+      "depsHostHostPropagated"
+      "depsTargetTarget"
+      "depsTargetTargetPropagated"
+    ]
+    && drv.drvAttrs.__structuredAttrs or false
+    && !lib.any (w: stdenvFunctions ? ${w}) words;
 
   # With fixDependencies, what modules get as config.system.path: the same attributes, but
   # interpolated it's /run/current-system/sw, without string context. So whatever refers to it
@@ -301,6 +369,7 @@ let
     pkgsRoot = pkgs.path;
     nixosRoot = "${modulesPath}/../..";
     enabled = cfg;
+    texinfo = pkgs.buildPackages.texinfo;
   };
   needsUpdate = "nixos-build-helpers needs an update (or set nixosBuildHelpers.allowUpstreamChanges to only warn).";
 

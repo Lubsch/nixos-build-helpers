@@ -8,6 +8,8 @@
   nixosRoot,
   # option name -> bool
   enabled,
+  # the texinfo whose install-info system.path runs
+  texinfo,
 }:
 let
   code = import ../upstream-code.nix;
@@ -69,6 +71,13 @@ let
     what = "${file} (`${text}`, INLINE_CONTENT_MAX in build_composefs_dump.rs)";
   };
 
+  texinfoChanged = {
+    options = [ "buildEnv" ];
+    changed =
+      texinfo.version != code.texinfo.version || map toString (texinfo.patches or [ ]) != code.texinfo.patches;
+    what = "texinfo (${texinfo.version}), whose install-info src/install_info.rs reimplements";
+  };
+
   # grep -H 'system\.path\b' <files> | LC_ALL=C sort
   systemPathUses = with code.systemPathUses; {
     options = [ "fixDependencies" ];
@@ -94,5 +103,5 @@ let
   };
 in
 map (c: "nixosBuildHelpers.${lib.concatStringsSep "/" c.options}: nixpkgs changed ${c.what}, which nixos-build-helpers reimplements or relies on.") (
-  lib.filter (c: any c.options && c.changed) (reimplemented ++ [ inlineMax systemPathUses ])
+  lib.filter (c: any c.options && c.changed) (reimplemented ++ [ inlineMax texinfoChanged systemPathUses ])
 )

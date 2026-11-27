@@ -24,8 +24,19 @@ let
   '';
   grepUses = "grep -H 'system\\.path\\b'";
 in
-runCommand "test-upstream" { } ''
+runCommand "test-upstream" { __structuredAttrs = true; } ''
   failed=0
+
+  # What stdenv's setup gives a buildCommand without inputs (this one), which buildEnv's
+  # `withoutStdenv` reproduces. Exports besides nix's own:
+  exports=$(while IFS= read -r -d "" kv; do echo "''${kv%%=*}"; done < <(env -0) | grep -vxE 'HOME|NIX_ATTRS_JSON_FILE|NIX_ATTRS_SH_FILE|NIX_BUILD_CORES|NIX_BUILD_TOP|NIX_LOG_FD|NIX_STORE|OLDPWD|PWD|SHLVL|TEMP|TEMPDIR|TERM|TMP|TMPDIR|_' | LC_ALL=C sort)
+  [[ $exports == ${lib.escapeShellArg (lib.concatStringsSep "\n" (lib.sort (a: b: a < b) code.stdenv.exports))} ]] \
+    || { echo "CHANGED: the variables stdenv's setup exports:"; echo "$exports"; failed=1; }
+  [[ $- == ${code.stdenv.flags} ]] || { echo "CHANGED: the shell options of a buildCommand: $-"; failed=1; }
+  functions=$(declare -F | cut -d' ' -f3 | LC_ALL=C sort)
+  [[ $functions == ${lib.escapeShellArg (lib.concatStringsSep "\n" (lib.sort (a: b: a < b) code.stdenv.functions))} ]] \
+    || { echo "CHANGED: stdenv's shell functions:"; diff <(echo ${lib.escapeShellArg (lib.concatStringsSep "\n" code.stdenv.functions)}) - <<< "$functions"; failed=1; }
+
   cd ${path}
 
   ${lib.concatMapStrings (

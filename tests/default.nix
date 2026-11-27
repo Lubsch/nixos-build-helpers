@@ -287,6 +287,21 @@ let
     minimal-overlay-all = mkTest "minimal" true (all // { etcOverlay = true; });
     fix-dependencies = fixDependencies;
     build-env = pkgs.callPackage ./build-env.nix { inherit fixtures compare; };
+    # buildEnv's install-info, on the Info files of the featureful system and generated ones
+    install-info =
+      let
+        corpus =
+          (mkSystem {
+            config = configs.featureful;
+            overlay = false;
+            options = { };
+          }).config.system.path;
+      in
+      pkgs.runCommand "test-install-info" { } ''
+        ${lib.getExe pkgs.python3} ${./install-info.py} ${pkgs.buildPackages.texinfo}/bin/install-info \
+          ${lib.getExe (pkgs.callPackage ../package.nix { })} ${corpus}/share/info 400
+        touch $out
+      '';
     upstream = pkgs.callPackage ./upstream.nix { };
     vm = pkgs.callPackage ./vm.nix { overlay = false; };
     vm-overlay = pkgs.callPackage ./vm.nix { overlay = true; };

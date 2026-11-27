@@ -9,7 +9,7 @@ reimplementation that produces **identical output** (checked by differential tes
 | `etc` | `system.build.etc` | bash, one `makeEtcEntry` call per file |
 | `etcOverlay` | `system.build.etcMetadataImage` (with `system.etc.overlay`), implies `etc` | python (`build-composefs-dump.py`) in its own derivation. We build /etc and its image in one derivation |
 | `systemdUnits` | `system-units`, `user-units`, `initrd-units`, `nspawn-units` (`generateUnits`) | bash, several commands per unit |
-| `buildEnv` | `system.path` (`/run/current-system/sw`) | perl (`buildenv/builder.pl`) |
+| `buildEnv` | `system.path` (`/run/current-system/sw`), and its `install-info` loop | perl (`buildenv/builder.pl`), one `install-info` per Info file |
 | `fixDependencies` | — | see below |
 | `fewerDerivations` | — | see below |
 
@@ -211,6 +211,28 @@ existed, but `builder.pl` links a directory whole if both packages' paths resolv
 differences are, and what makes the current version faster: it creates ~1400 fewer entries (894
 → 214 `mkdir`s).
 
+Linking is only part of `system.path`'s build. Of ~630 ms for the `desktop` configuration
+(`nix-store --realise`, timestamps inside the builder), ~120 ms pass before the builder starts
+(the daemon, the sandbox with ~1800 input paths), 40 ms in stdenv's setup, 76 ms linking, 231 ms
+in `postBuild` (`update-mime-database` 162 ms, `install-info` 62 ms) and 160 ms after it
+(registering the ~20k entries of the output, deleting the build directory). `buildEnv` also:
+- runs the build command without stdenv's setup when nothing needs it (no inputs with setup
+  hooks, and no stdenv function named in `postBuild`), with what of it a build command sees: its
+  shell options and exports (`SOURCE_DATE_EPOCH`, `TZ`, `GZIP_NO_TIMESTAMPS`, …) and `PATH`
+  from stdenv's tools. `tests/upstream.nix` compares that with stdenv's setup.
+- replaces the loop of `documentation.info` that runs `install-info` once per Info file (37 in
+  `desktop`) with `nixos-build-helpers install-info`, a port of texinfo's `install-info.c` that
+  does them all in one process and writes the same `dir` file, byte for byte. What it doesn't
+  reproduce runs `install-info` itself, on the `dir` file as made so far: compressed or truncated
+  Info files, input `install-info` rejects (or overflows its buffer on, which aborts it), an
+  existing `dir` file, a locale in the environment, and two entries of one new section whose
+  names differ only in case, whose order would be up to glibc's `qsort`. `tests/install-info.py`
+  compares the two on the test system's Info files (which must not need `install-info`) and on
+  generated ones.
+
+Together ~60 ms per package change (`desktop`: 637 → 576 ms, median of 8): `install-info` takes
+~10 ms instead of 62, stdenv's setup ~20 ms instead of 50.
+
 **Rebuilding after a small change**, i.e. what `nixos-rebuild` waits for until activation
 (evaluation + build, median of 5):
 
@@ -291,9 +313,9 @@ then differ from nixpkgs'.
   to `system.path`) are compared with store hashes normalized; everything else is byte-exact.
   `nix build .#tests.matrix` runs all 24 combinations of options.
 - **Drift detection** (`upstream-code.nix`): hashes of the code in nixpkgs we reimplement or rely
-  on (`builder.pl`, `build-composefs-dump.py`, `generateUnits`, the etc builder, the lines using
-  `system.path` for `fixDependencies`, the fields of nixos-init's bootspec extension for
-  `fewerDerivations`). The module checks those of the enabled options at evaluation time against
+  on (`builder.pl`, `build-composefs-dump.py`, `generateUnits`, the etc builder, the
+  `install-info` loop of `documentation.nix` and texinfo's version, the lines using `system.path`
+  for `fixDependencies`, the fields of nixos-init's bootspec extension for `fewerDerivations`). The module checks those of the enabled options at evaluation time against
   the nixpkgs the system is built with (`lib/upstream-check.nix`, a few ms), so a nixpkgs that
   follows yours fails the build, not only this repository's `nix flake check`.
   `tests/upstream.nix` checks the same with sed and grep (which also tests the module's

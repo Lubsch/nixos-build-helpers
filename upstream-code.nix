@@ -45,7 +45,23 @@
       };
       sha256 = "482d461bba6a0a21e513228fefff11ebc6afcd014bcf6842fa253842600e78f1";
     }
+    {
+      # The install-info loop that buildEnv runs in one process (src/install_info.rs)
+      options = [ "buildEnv" ];
+      file = "nixos/modules/misc/documentation.nix";
+      range = {
+        from = "      environment.extraSetup = ''";
+        to = "      '';";
+      };
+      sha256 = "74c53ba43fc937f5a905a063f73111b27e6220dd66812aef747b193f1218a7af";
+    }
   ];
+
+  # buildEnv: src/install_info.rs is a port of install-info.c of this texinfo, unpatched
+  texinfo = {
+    version = "7.2";
+    patches = [ ];
+  };
 
   # etcOverlay: must match INLINE_CONTENT_MAX in src/build_composefs_dump.rs
   etcInlineContentMax = {
@@ -74,6 +90,127 @@
       "nixos/modules/system/activation/top-level.nix"
     ];
     sha256 = "c9f971379eb21bf89f1ddcd038c97ac2096e71f3a51c647dd48a11a43b7096ae";
+  };
+
+  # buildEnv builds system.path without stdenv's setup (~35 ms), with what of it a buildCommand
+  # without inputs sees (`withoutStdenv` in module.nix). tests/upstream.nix compares this with what
+  # stdenv's setup provides.
+  stdenv = {
+    # Exported by stdenv's setup, besides what nix sets. `withoutStdenv` sets all but the marked.
+    exports = [
+      "CONFIG_SHELL"
+      "GZIP_NO_TIMESTAMPS"
+      "HOST_PATH" # not set: for patchShebangs in fixupPhase
+      "NIX_CFLAGS_COMPILE" # not set: compiler wrapper
+      "NIX_ENFORCE_NO_NATIVE" # not set: compiler wrapper
+      "NIX_ENFORCE_PURITY" # not set: compiler wrapper
+      "NIX_LDFLAGS" # not set: compiler wrapper
+      "NIX_SSL_CERT_FILE"
+      "PATH" # without the default native build inputs (patchelf, for fixupPhase)
+      "SHELL"
+      "SOURCE_DATE_EPOCH"
+      "SSL_CERT_FILE"
+      "TZ"
+      "XDG_DATA_DIRS" # not set: patchelf's share
+      "out"
+      "shell"
+    ];
+    # The options a buildCommand runs with (`$-`)
+    flags = "ehB";
+    # Its shell functions: system.path is built with stdenv when its postBuild mentions one.
+    functions = [
+      "_activatePkgs"
+      "_addRpathPrefix"
+      "_addToEnv"
+      "_allFlags"
+      "_assignFirst"
+      "_callImplicitHook"
+      "_defaultUnpack"
+      "_doStrip"
+      "_eval"
+      "_exportOutputsByName"
+      "_logHook"
+      "_makeSymlinksRelative"
+      "_moveLib64"
+      "_moveSbin"
+      "_moveSystemdUserUnits"
+      "_moveToShare"
+      "_multioutConfig"
+      "_multioutDevs"
+      "_multioutDocs"
+      "_multioutPropagateDev"
+      "_nixLogWithLevel"
+      "_overrideFirst"
+      "_pruneLibtoolFiles"
+      "_updateSourceDateEpochFromSourceRoot"
+      "activatePackage"
+      "addEnvHooks"
+      "addToSearchPath"
+      "addToSearchPathWithCustomDelimiter"
+      "appendToVar"
+      "auditTmpdir"
+      "buildPhase"
+      "checkPhase"
+      "compressManPages"
+      "concatStringsSep"
+      "concatTo"
+      "configurePhase"
+      "consumeEntire"
+      "definePhases"
+      "distPhase"
+      "dumpVars"
+      "echoCmd"
+      "exitHandler"
+      "findInputs"
+      "fixLibtool"
+      "fixupPhase"
+      "genericBuild"
+      "getAllOutputNames"
+      "installCheckPhase"
+      "installPhase"
+      "isELF"
+      "isMachO"
+      "isScript"
+      "mapOffset"
+      "moveToOutput"
+      "nixChattyLog"
+      "nixDebugLog"
+      "nixErrorLog"
+      "nixInfoLog"
+      "nixLog"
+      "nixNoticeLog"
+      "nixTalkativeLog"
+      "nixVomitLog"
+      "nixWarnLog"
+      "noBrokenSymlinks"
+      "noBrokenSymlinksInAllOutputs"
+      "patchELF"
+      "patchPhase"
+      "patchShebangs"
+      "patchShebangsAuto"
+      "prependToVar"
+      "printLines"
+      "printPhases"
+      "printWords"
+      "recordPropagatedDependencies"
+      "runHook"
+      "runOneHook"
+      "runPhase"
+      "showPhaseFooter"
+      "showPhaseHeader"
+      "stripDirs"
+      "stripHash"
+      "substitute"
+      "substituteAll"
+      "substituteAllInPlace"
+      "substituteAllStream"
+      "substituteInPlace"
+      "substituteStream"
+      "unpackFile"
+      "unpackPhase"
+      "updateAutotoolsGnuConfigScriptsPhase"
+      "updateSourceDateEpoch"
+    ];
   };
 
   # fewerDerivations with the /etc overlay: the fields of nixos-init's bootspec extension. Two refer

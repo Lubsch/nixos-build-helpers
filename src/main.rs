@@ -7,8 +7,10 @@ mod build_composefs_dump;
 mod build_env;
 mod build_etc;
 mod generate_units;
+mod install_info;
 
-const COMMANDS: &str = "Commands: build-composefs-dump, build-etc, generate-units, build-env";
+const COMMANDS: &str =
+    "Commands: build-composefs-dump, build-etc, generate-units, build-env, install-info";
 
 fn main() -> Result<()> {
     let command = std::env::args()
@@ -20,6 +22,7 @@ fn main() -> Result<()> {
         "build-etc" => build_etc::run(read_attrs()?, &out()?),
         "generate-units" => generate_units::run(read_attrs()?, &out()?),
         "build-env" => build_env::run(read_attrs()?),
+        "install-info" => install_info::run(std::env::args_os().skip(2).collect()),
         _ => Err(anyhow!("unknown command: \"{command}\"\n{COMMANDS}")),
     }
 }
